@@ -169,6 +169,36 @@ public class NativeCameraServerTest {
             d.motion(false);assertEquals("visitor",status(c));d.ring(false);assertEquals("none",status(c));
         }}
     }
+    @Test public void nvrCanRequestFreshKeyframes() throws Exception {
+        DeviceState d=device();java.util.concurrent.atomic.AtomicInteger requests=new java.util.concurrent.atomic.AtomicInteger();
+        d.media.requestKeyframe=requests::incrementAndGet;d.subMedia.requestKeyframe=requests::incrementAndGet;
+        try(NativeCameraServer server=new NativeCameraServer(d,0)){server.start();try(Client c=new Client(server.port())){
+            assertEquals(200,c.login("test-only-password"));c.command(189,Xml.body("<RequestIframe><channelId>0</channelId></RequestIframe>"));
+            assertEquals(200,c.receive().status());assertEquals(2,requests.get());
+        }}
+    }
+    @Test public void fragmentedFramesFromTwoStreamsNeverInterleave() throws Exception {
+        DeviceState d=device();
+        try(NativeCameraServer server=new NativeCameraServer(d,0)){server.start();try(Client c=new Client(server.port())){
+            assertEquals(200,c.login("test-only-password"));
+            c.id=0x100fa;c.command(3,preview("mainStream"));c.receive();
+            c.id=0x200fa;c.command(3,preview("subStream"));c.receive();
+            for(int round=0;round<8;round++) {
+                byte[] payload=new byte[96000];payload[0]=0;payload[1]=0;payload[2]=1;payload[3]=0x65;
+                d.media.publish(new MediaHub.Frame(payload,round,true,false));
+                d.subMedia.publish(new MediaHub.Frame(payload,round,true,false));
+                for(int stream=0;stream<2;stream++) {
+                    Baichuan.Packet first=c.receive();int message=first.message();
+                    assertEquals(32000,first.body().length);
+                    for(int part=1;part<4;part++) {
+                        Baichuan.Packet fragment=c.receive();
+                        assertEquals("Another stream interrupted a BCMedia frame",message,fragment.message());
+                        assertEquals(part==3?24:32000,fragment.body().length);
+                    }
+                }
+            }
+        }}
+    }
     @Test public void simultaneousStreamsStopIndependentlyAndRestart()throws Exception {
         DeviceState d=device();d.subMedia.width=640;d.subMedia.height=360;
         try(NativeCameraServer server=new NativeCameraServer(d,0)){server.start();try(Client c=new Client(server.port())){

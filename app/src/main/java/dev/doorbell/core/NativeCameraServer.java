@@ -26,6 +26,7 @@ public final class NativeCameraServer extends TcpServer {
         boolean authenticated, challenged;
         volatile boolean aesMode=true;
         volatile boolean subscribed;
+        final Object mediaFrameLock = new Object();
         final Map<String,Playback> playbacks = new ConcurrentHashMap<>();
         int eventId;
         volatile int wireMagic=0x0abcdef0;
@@ -83,6 +84,10 @@ public final class NativeCameraServer extends TcpServer {
                         case 93 -> reply(93,p.message(),200,Xml.body("<LinkType version=\"1.1\"><type>WIFI</type></LinkType>"),false);
                         case 114 -> reply(114,p.message(),200,Xml.body("<P2p version=\"1.1\"><uid>"+state.id+"</uid></P2p>"),false);
                         case 151 -> reply(151,p.message(),200,Xml.body(NativeMetadata.abilities(state)),false);
+                        case 189 -> {
+                            state.media.requestKeyframe.run();state.subMedia.requestKeyframe.run();
+                            reply(189,p.message(),200,"",false);
+                        }
                         case 199 -> reply(199,p.message(),200,Xml.body(NativeMetadata.support(state)),false);
                         case 146 -> reply(146,p.message(),200,Xml.body(NativeMetadata.streamInfo(state)),false);
                         default -> {state.log("UNSUPPORTED native command "+p.command());reply(p.command(),p.message(),400,"",false);}
@@ -170,15 +175,21 @@ public final class NativeCameraServer extends TcpServer {
                             emit(Baichuan.info(hub));width=hub.width;height=hub.height;fps=hub.fps;
                         }
                         byte[] data=f.audio()?Baichuan.audio(f):Baichuan.video(f);
-                        for(int offset=0;offset<data.length && active.get();offset+=32000)
-                            emit(Arrays.copyOfRange(data,offset,Math.min(offset+32000,data.length)));
+                        // NVR parsers need a complete BCMedia frame before another stream's
+                        // frame starts, even though each fragment carries its stream message ID.
+                        synchronized(mediaFrameLock) {
+                            for(int offset=0;offset<data.length && active.get();offset+=32000)
+                                emit(Arrays.copyOfRange(data,offset,Math.min(offset+32000,data.length)));
+                        }
                     }
                 } catch(Exception e) {
                     if(active.get()) { state.log("Native stream ended: "+e.getClass().getSimpleName());writer.close(); }
                 } finally { close(); }
             }
-            synchronized void emit(byte[] data)throws Exception {
-                if(active.get()) { binary(request,data,!binaryAnnounced); binaryAnnounced=true; }
+            void emit(byte[] data)throws Exception {
+                synchronized(mediaFrameLock) {
+                    if(active.get()) { binary(request,data,!binaryAnnounced); binaryAnnounced=true; }
+                }
             }
             public synchronized void close() {
                 if (!active.getAndSet(false)) return;
