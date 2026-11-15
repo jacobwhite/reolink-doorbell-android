@@ -169,6 +169,19 @@ public class NativeCameraServerTest {
             d.motion(false);assertEquals("visitor",status(c));d.ring(false);assertEquals("none",status(c));
         }}
     }
+    @Test public void encodingResponseUsesNvrCompressionSchema() throws Exception {
+        DeviceState d=device();
+        try(NativeCameraServer server=new NativeCameraServer(d,0)){server.start();try(Client c=new Client(server.port())){
+            assertEquals(200,c.login("test-only-password"));c.command(56,"");
+            org.w3c.dom.Document doc=Xml.parse(text(Baichuan.aes(c.receive().body(),c.key,false)));
+            assertEquals(1,doc.getElementsByTagName("Compression").getLength());
+            assertEquals(0,doc.getElementsByTagName("Enc").getLength());
+            assertEquals("1280*720",Xml.text(doc,"resolutionName"));
+            assertEquals("vbr",Xml.text(doc,"encoderType"));
+            c.command(112,"");
+            assertTrue(text(Baichuan.aes(c.receive().body(),c.key,false)).contains("<Compression"));
+        }}
+    }
     @Test public void nvrCanRequestFreshKeyframes() throws Exception {
         DeviceState d=device();java.util.concurrent.atomic.AtomicInteger requests=new java.util.concurrent.atomic.AtomicInteger();
         d.media.requestKeyframe=requests::incrementAndGet;d.subMedia.requestKeyframe=requests::incrementAndGet;

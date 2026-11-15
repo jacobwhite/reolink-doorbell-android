@@ -1,10 +1,10 @@
 # Doorbell Lab for Android
 
-An experimental Android camera that emulates a native Reolink doorbell over Baichuan TCP. Version **0.2.19**. Unofficial; not a complete Reolink camera replacement.
+An experimental Android camera that emulates a native Reolink doorbell over Baichuan TCP. Version **0.2.21**. Unofficial; not a complete Reolink camera replacement.
 
 Tested with **RLN8-410 / N3MB01 / v3.5.1.368_25010352**: native live video, Visitor alarm logging, and Visitor push notifications through the NVR are user-confirmed. Compatibility with other hardware or firmware is unverified.
 
-> Current hardware regression: the tester reports no NVR video with 0.2.19, despite successful direct native decoding. Recovery is under investigation; passing unit tests do not establish NVR playback.
+> Version 0.2.21: Reolink app playback through the NVR is user-confirmed after correcting native encoding metadata and implementing default encoding queries.
 
 ## Features
 

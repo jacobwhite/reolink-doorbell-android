@@ -26,7 +26,7 @@ async def probe(args):
             ports = await client.get_ports()
             assert ports["server"]["port"] > 0
             print("PASS: configured network ports parsed by reolink_aio")
-            for command, tag in [(56, "Enc"), (104, "SystemGeneral"), (146, "StreamInfoList"), (151, "AbilityInfo")]:
+            for command, tag in [(56, "Compression"), (104, "SystemGeneral"), (146, "StreamInfoList"), (151, "AbilityInfo")]:
                 assert tag in await client.send(cmd_id=command)
             print("PASS: encoding, clock, stream table and capabilities")
             if args.sync_clock:

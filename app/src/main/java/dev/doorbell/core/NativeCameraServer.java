@@ -75,7 +75,7 @@ public final class NativeCameraServer extends TcpServer {
                         case 37 -> reply(37,p.message(),200,Xml.body(NativeMetadata.ports(state,port())),false);
                         case 44,110 -> reply(p.command(),p.message(),200,Xml.body(NativeMetadata.osd()),false);
                         case 45 -> reply(45,p.message(),"Doorbell".equals(Xml.text(Xml.parse(body),"name"))?200:400,"",false);
-                        case 56 -> reply(56,p.message(),200,Xml.body(NativeMetadata.encoding(state)),false);
+                        case 56,112 -> reply(p.command(),p.message(),200,Xml.body(NativeMetadata.encoding(state)),false);
                         case 58 -> reply(58,p.message(),200,Xml.body("<UserList version=\"1.1\"><User><userName>"+Xml.escape(state.username)+"</userName><userLevel>1</userLevel></User></UserList>"),false);
                         case 81 -> reply(81,p.message(),200,Xml.body("<Record version=\"1.1\"><channelId>0</channelId><enable>0</enable></Record>"),false);
                         case 104 -> reply(104,p.message(),200,Xml.body(state.clock.xml()),false);

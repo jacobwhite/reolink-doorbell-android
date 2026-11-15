@@ -36,11 +36,12 @@ final class NativeMetadata {
             media.fps + "</framerateTable><bitrateTable>" + media.bitrateKbps + "</bitrateTable></encodeTable>";
     }
     static String encoding(DeviceState state) {
-        return "<Enc version=\"1.1\"><channelId>0</channelId>" + encoding("mainStream",state.media,state.audioEnabled) +
-            encoding("subStream",state.subMedia,state.audioEnabled) + "</Enc>";
+        return "<Compression version=\"1.1\"><channelId>0</channelId><isNoTranslateFrame>1</isNoTranslateFrame>" + encoding("mainStream",state.media,state.audioEnabled) +
+            encoding("subStream",state.subMedia,state.audioEnabled) + "</Compression>";
     }
     private static String encoding(String name, MediaHub media, boolean audio) {
-        return "<" + name + "><videoEncType>0</videoEncType><width>" + media.width + "</width><height>" +
+        return "<" + name + "><resolutionName>" + media.width + "*" + media.height +
+            "</resolutionName><encoderType>vbr</encoderType><encoderProfile>high</encoderProfile><videoEncType>0</videoEncType><width>" + media.width + "</width><height>" +
             media.height + "</height><frame>" + media.fps + "</frame><bitRate>" + media.bitrateKbps +
             "</bitRate><audio>" + (audio ? 1 : 0) + "</audio></" + name + ">";
     }
