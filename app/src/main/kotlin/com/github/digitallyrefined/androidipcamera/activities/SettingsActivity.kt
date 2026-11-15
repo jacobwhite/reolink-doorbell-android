@@ -1,0 +1,757 @@
+package com.github.digitallyrefined.androidipcamera.activities
+
+import android.app.Activity
+import android.content.Intent
+import android.content.SharedPreferences
+import android.net.Uri
+import android.os.Build
+import android.os.Bundle
+import android.widget.Toast
+import androidx.appcompat.app.AlertDialog
+import androidx.appcompat.app.AppCompatActivity
+import androidx.documentfile.provider.DocumentFile
+import androidx.preference.EditTextPreference
+import androidx.preference.Preference
+import androidx.preference.PreferenceCategory
+import androidx.preference.PreferenceFragmentCompat
+import androidx.preference.PreferenceManager
+import com.github.digitallyrefined.androidipcamera.R
+import com.github.digitallyrefined.androidipcamera.StreamingService
+import com.github.digitallyrefined.androidipcamera.helpers.InputValidator
+import com.github.digitallyrefined.androidipcamera.helpers.ListenInterface
+import com.github.digitallyrefined.androidipcamera.helpers.RecordingsHelper
+import com.github.digitallyrefined.androidipcamera.helpers.RelayAssociation
+import com.github.digitallyrefined.androidipcamera.helpers.RtspServer
+import com.github.digitallyrefined.androidipcamera.helpers.SecureStorage
+import com.github.digitallyrefined.androidipcamera.helpers.TlsHelper
+import java.io.File
+import com.github.digitallyrefined.androidipcamera.helpers.NativeDoorbellBridge
+
+class SettingsActivity : AppCompatActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        window.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        supportFragmentManager
+            .beginTransaction()
+            .replace(android.R.id.content, SettingsFragment())
+            .commit()
+    }
+
+    class SettingsFragment : PreferenceFragmentCompat() {
+        companion object {
+            private const val PICK_CERTIFICATE_FILE = 1
+            private const val PICK_RECORDING_FOLDER = 2
+            private const val PREF_ONVIF_NAME = "onvif_name"
+            private const val PREF_ONVIF_PORT = "onvif_port"
+            // Longer than the service's worst-case delete retry window, so a
+            // crashed service cannot leave the relay section disabled forever.
+            private const val RELAY_DELETING_TIMEOUT_MS = 120_000L
+        }
+
+        // The relay client clears the association from the service when the
+        // relay rejects the camera. Refresh this screen immediately so the
+        // pairing row and disconnect button reflect that change.
+        private val relayPreferenceListener =
+            SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+                if (key == "relay_connected" ||
+                    key == "relay_status" ||
+                    key == "relay_deleting"
+                ) {
+                    refreshRelayPreferences()
+                }
+            }
+
+        override fun onCreatePreferences(savedInstanceState: Bundle?, rootKey: String?) {
+            setPreferencesFromResource(R.xml.preferences, rootKey)
+            findPreference<Preference>("native_doorbell_enabled")?.setOnPreferenceChangeListener { _, _ ->
+                restartStreamingServer(); true
+            }
+            findPreference<Preference>("motion_detection_enabled")?.setOnPreferenceChangeListener { _, value ->
+                requireContext().startService(Intent(requireContext(), StreamingService::class.java).apply {
+                    action = StreamingService.ACTION_SET_MOTION
+                    putExtra("enabled", value as Boolean)
+                })
+                true
+            }
+            findPreference<Preference>("native_ring")?.setOnPreferenceClickListener {
+                requireContext().startService(Intent(requireContext(), StreamingService::class.java).apply {
+                    action = StreamingService.ACTION_RING_DOORBELL
+                })
+                Toast.makeText(requireContext(), "Doorbell test event queued", Toast.LENGTH_SHORT).show()
+                true
+            }
+            findPreference<Preference>("native_diagnostics")?.setOnPreferenceClickListener {
+                val report = NativeDoorbellBridge.active?.diagnostics() ?: "Native server has not started. Return to the camera screen first."
+                AlertDialog.Builder(requireContext()).setTitle("Native compatibility diagnostics").setMessage(report)
+                    .setPositiveButton("Copy") { _, _ ->
+                        val clipboard = requireContext().getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                        clipboard.setPrimaryClip(android.content.ClipData.newPlainText("Doorbell diagnostics", report))
+                    }.setNegativeButton("Close", null).show()
+                true
+            }
+
+
+            // Starting the camera/microphone foreground service from BOOT_COMPLETED is only
+            // blocked on Android 14+, where the app posts a notification instead. Only warn while
+            // the option is enabled.
+            findPreference<androidx.preference.CheckBoxPreference>("start_on_boot")?.apply {
+                summaryProvider = Preference.SummaryProvider<androidx.preference.CheckBoxPreference> {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE && it.isChecked) {
+                        "⚠️ Warning: Android 14+ does not let the camera or microphone start automatically after boot. A notification will be shown to open the app so streaming can start."
+                    } else {
+                        "Auto start on Android 13 and older. On Android 14+ a notification will be shown"
+                    }
+                }
+            }
+
+            // Set up certificate selection preference
+            findPreference<Preference>("certificate_path")?.apply {
+                setOnPreferenceClickListener {
+                    val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                        addCategory(Intent.CATEGORY_OPENABLE)
+                        type = "*/*"
+                        putExtra(Intent.EXTRA_MIME_TYPES, arrayOf("application/x-pkcs12", "application/pkcs12", "*/*"))
+                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
+                    }
+                    startActivityForResult(
+                        Intent.createChooser(intent, "Select TLS Certificate"),
+                        PICK_CERTIFICATE_FILE
+                    )
+                    true
+                }
+
+                setOnPreferenceChangeListener { _, _ ->
+                    // Restart server when certificate path changes
+                    restartStreamingServer()
+                    true
+                }
+            }
+
+            val secureStorage = SecureStorage(requireContext())
+
+            // Configure authentication enable/disable checkbox
+            findPreference<androidx.preference.CheckBoxPreference>("enable_auth")?.apply {
+                // Initialize visibility based on current value
+                val enabled = isChecked
+                findPreference<EditTextPreference>("username")?.isVisible = enabled
+                findPreference<EditTextPreference>("password")?.isVisible = enabled
+
+                setOnPreferenceChangeListener { _, newValue ->
+                    val enabled = newValue as Boolean
+                    // Show/hide username and password preferences
+                    findPreference<EditTextPreference>("username")?.isVisible = enabled
+                    findPreference<EditTextPreference>("password")?.isVisible = enabled
+                    // Restart server when authentication setting changes
+                    restartStreamingServer()
+                    true
+                }
+            }
+
+            // Configure TLS checkbox and version to hide/show certificate options
+            val tlsCheckbox = findPreference<androidx.preference.CheckBoxPreference>("tls_enabled")
+            fun updateTlsVisibility(enabled: Boolean) {
+                findPreference<androidx.preference.ListPreference>("tls_version")?.isVisible = enabled
+                findPreference<Preference>("certificate_path")?.isVisible = enabled
+                findPreference<EditTextPreference>("certificate_password")?.isVisible = enabled
+                findPreference<Preference>("test_certificate")?.isVisible = enabled
+            }
+            updateTlsVisibility(tlsCheckbox?.isChecked ?: true)
+            tlsCheckbox?.setOnPreferenceChangeListener { _, newValue ->
+                val enabled = newValue as Boolean
+                updateTlsVisibility(enabled)
+                restartStreamingServer()
+                true
+            }
+            findPreference<androidx.preference.ListPreference>("tls_version")?.setOnPreferenceChangeListener { _, _ ->
+                restartStreamingServer()
+                true
+            }
+
+            // Configure username (optional - defaults available)
+            findPreference<EditTextPreference>("username")?.apply {
+                // Load current value from secure storage
+                val currentUsername =
+                    secureStorage.getSecureString(SecureStorage.KEY_USERNAME, "") ?: ""
+                text = currentUsername
+                summary = if (currentUsername.isBlank()) "Not set" else currentUsername
+
+                setOnPreferenceChangeListener { _, newValue ->
+                    val username = newValue.toString()
+                    if (username.isNotEmpty() && !InputValidator.isValidUsername(username)) {
+                        Toast.makeText(requireContext(),
+                            "Username must be 1-50 characters, letters/numbers/hyphens/underscores only",
+                            Toast.LENGTH_LONG).show()
+                        return@setOnPreferenceChangeListener false
+                    }
+                    // Store securely (empty string means use default)
+                    secureStorage.putSecureString(SecureStorage.KEY_USERNAME, username)
+                    summary = if (username.isBlank()) "Not set" else username
+                    // Restart server when username changes
+                    restartStreamingServer()
+                    true
+                }
+            }
+
+            // Configure password (optional - defaults available)
+            findPreference<EditTextPreference>("password")?.apply {
+                // Never reveal the stored password, only whether one is set.
+                summary = if (
+                    (secureStorage.getSecureString(SecureStorage.KEY_PASSWORD, "") ?: "").isEmpty()
+                ) {
+                    "Not set"
+                } else {
+                    "***"
+                }
+
+                // Do not show the existing password when editing
+                setOnBindEditTextListener { editText ->
+                    editText.text = null
+                    editText.hint = "Enter new password"
+                }
+
+                setOnPreferenceChangeListener { _, newValue ->
+                    val password = newValue.toString()
+
+                    // Empty input means "no change" – keep existing password
+                    if (password.isEmpty()) {
+                        return@setOnPreferenceChangeListener false
+                    }
+
+                    if (!InputValidator.isValidPassword(password)) {
+                        Toast.makeText(
+                            requireContext(),
+                            "Password must be 8-128 characters with uppercase, lowercase, and number",
+                            Toast.LENGTH_LONG
+                        ).show()
+                        return@setOnPreferenceChangeListener false
+                    }
+
+                    // Store securely only; do not persist plaintext in SharedPreferences
+                    secureStorage.putSecureString(SecureStorage.KEY_PASSWORD, password)
+                    summary = "***"
+                    // Restart server when password changes
+                    restartStreamingServer()
+                    // Returning false prevents EditTextPreference from saving the plaintext
+                    false
+                }
+            }
+
+            // Configure streaming port preference
+            findPreference<EditTextPreference>("server_port")?.apply {
+                setOnBindEditTextListener { editText ->
+                    editText.inputType = android.text.InputType.TYPE_CLASS_NUMBER
+                }
+
+                setOnPreferenceChangeListener { _, newValue ->
+                    val portStr = newValue.toString()
+                    val port = portStr.toIntOrNull()
+                    if (port == null || port !in 1..65535) {
+                        Toast.makeText(
+                            requireContext(),
+                            "Port must be between 1 and 65535",
+                            Toast.LENGTH_LONG
+                        ).show()
+                        return@setOnPreferenceChangeListener false
+                    }
+                    if (isRtspEnabled() && port == configuredRtspPort()) {
+                        Toast.makeText(requireContext(), "Port is already used by the RTSP server", Toast.LENGTH_LONG).show()
+                        return@setOnPreferenceChangeListener false
+                    }
+                    if (isRtspEnabled() && port == configuredOnvifPort()) {
+                        Toast.makeText(requireContext(), "Port is already used by the ONVIF server", Toast.LENGTH_LONG).show()
+                        return@setOnPreferenceChangeListener false
+                    }
+                    summary = "Port $port"
+                    restartStreamingServer()
+                    true
+                }
+            }
+
+            // Interface shared by the web, RTSP and ONVIF servers. The list is rebuilt from the
+            // interfaces present when settings are opened, so it never offers a stale address.
+            findPreference<androidx.preference.ListPreference>(ListenInterface.PREF)?.apply {
+                val options = ListenInterface.options()
+                entries = options.map { it.first }.toTypedArray()
+                entryValues = options.map { it.second }.toTypedArray()
+                // Migrates IP addresses saved by older versions to the matching interface name.
+                value = ListenInterface.value(requireContext())
+                summaryProvider = Preference.SummaryProvider<androidx.preference.ListPreference> {
+                    it.entry ?: "All interfaces"
+                }
+                setOnPreferenceChangeListener { _, newValue ->
+                    if (newValue.toString() !in entryValues) {
+                        return@setOnPreferenceChangeListener false
+                    }
+                    restartStreamingServer()
+                    true
+                }
+            }
+
+            // Optional RTSP/ONVIF server: shares the camera, encoder and credentials with the HTTP
+            // server. ONVIF is part of this switch.
+            findPreference<androidx.preference.CheckBoxPreference>(RtspServer.PREF_ENABLED)?.apply {
+                setRtspOptionsVisible(isChecked)
+                setOnvifOptionsVisible(isChecked)
+                summaryProvider = Preference.SummaryProvider<androidx.preference.CheckBoxPreference> {
+                    "Serve the camera at ${if (TlsHelper.isEnabled(requireContext())) "rtsps" else "rtsp"}://[ip_address]:[port]/live (H.264 video, AAC audio) and enable ONVIF discovery/control for VLC, Frigate, NVRs and Home Assistant, using the same username and password"
+                }
+
+                setOnPreferenceChangeListener { _, newValue ->
+                    val enabled = newValue as Boolean
+                    if (enabled && configuredRtspPort() == configuredHttpPort()) {
+                        Toast.makeText(requireContext(),
+                            "RTSP port must differ from the streaming port",
+                            Toast.LENGTH_LONG).show()
+                        return@setOnPreferenceChangeListener false
+                    }
+                    if (enabled && configuredRtspPort() == configuredOnvifPort()) {
+                        Toast.makeText(requireContext(),
+                            "RTSP port must differ from the ONVIF port",
+                            Toast.LENGTH_LONG).show()
+                        return@setOnPreferenceChangeListener false
+                    }
+                    if (enabled && configuredOnvifPort() == configuredHttpPort()) {
+                        Toast.makeText(requireContext(),
+                            "ONVIF port must differ from the streaming port",
+                            Toast.LENGTH_LONG).show()
+                        return@setOnPreferenceChangeListener false
+                    }
+                    setRtspOptionsVisible(enabled)
+                    setOnvifOptionsVisible(enabled)
+                    restartStreamingServer()
+                    true
+                }
+            }
+
+            findPreference<EditTextPreference>(RtspServer.PREF_PORT)?.apply {
+                setOnBindEditTextListener { editText ->
+                    editText.inputType = android.text.InputType.TYPE_CLASS_NUMBER
+                }
+
+                setOnPreferenceChangeListener { _, newValue ->
+                    val port = newValue.toString().toIntOrNull()
+                    if (port == null || port !in 1..65535) {
+                        Toast.makeText(requireContext(), "Port must be between 1 and 65535", Toast.LENGTH_LONG).show()
+                        return@setOnPreferenceChangeListener false
+                    }
+                    if (port == configuredHttpPort()) {
+                        Toast.makeText(requireContext(), "RTSP port must differ from the streaming port", Toast.LENGTH_LONG).show()
+                        return@setOnPreferenceChangeListener false
+                    }
+                    if (isRtspEnabled() && port == configuredOnvifPort()) {
+                        Toast.makeText(requireContext(), "RTSP port must differ from the ONVIF port", Toast.LENGTH_LONG).show()
+                        return@setOnPreferenceChangeListener false
+                    }
+                    summary = "Port $port"
+                    restartStreamingServer()
+                    true
+                }
+            }
+
+            // ONVIF follows the RTSP switch: it advertises the RTSP stream and motion events.
+            findPreference<EditTextPreference>(PREF_ONVIF_NAME)?.apply {
+                setOnPreferenceChangeListener { _, _ ->
+                    restartStreamingServer()
+                    true
+                }
+            }
+
+            findPreference<EditTextPreference>(PREF_ONVIF_PORT)?.apply {
+                setOnBindEditTextListener { editText ->
+                    editText.inputType = android.text.InputType.TYPE_CLASS_NUMBER
+                }
+                setOnPreferenceChangeListener { _, newValue ->
+                    val port = newValue.toString().toIntOrNull()
+                    if (port == null || port !in 1..65535) {
+                        Toast.makeText(requireContext(), "Port must be between 1 and 65535", Toast.LENGTH_LONG).show()
+                        return@setOnPreferenceChangeListener false
+                    }
+                    if (port == configuredHttpPort()) {
+                        Toast.makeText(requireContext(), "ONVIF port must differ from the streaming port", Toast.LENGTH_LONG).show()
+                        return@setOnPreferenceChangeListener false
+                    }
+                    if (port == configuredRtspPort()) {
+                        Toast.makeText(requireContext(), "ONVIF port must differ from the RTSP port", Toast.LENGTH_LONG).show()
+                        return@setOnPreferenceChangeListener false
+                    }
+                    summary = "Port $port"
+                    restartStreamingServer()
+                    true
+                }
+            }
+
+            // Add validation for certificate password
+            findPreference<EditTextPreference>("certificate_password")?.apply {
+                // Do not pre-fill the existing certificate password when editing
+                setOnBindEditTextListener { editText ->
+                    editText.text = null
+                    editText.hint = "Enter certificate password"
+                }
+
+                setOnPreferenceChangeListener { _, newValue ->
+                    val password = newValue.toString()
+                    if (!InputValidator.isValidCertificatePassword(password)) {
+                        Toast.makeText(
+                            requireContext(),
+                            "Certificate password too long (max 256 characters)",
+                            Toast.LENGTH_LONG
+                        ).show()
+                        return@setOnPreferenceChangeListener false
+                    }
+
+                    // Basic validation - check if password is not empty for certificate usage
+                    if (password.isEmpty()) {
+                        Toast.makeText(
+                            requireContext(),
+                            "Certificate password is required",
+                            Toast.LENGTH_LONG
+                        ).show()
+                        return@setOnPreferenceChangeListener false
+                    }
+
+                    // Store securely only; do not persist plaintext in SharedPreferences
+                    secureStorage.putSecureString(SecureStorage.KEY_CERT_PASSWORD, password)
+                    Toast.makeText(
+                        requireContext(),
+                        "Certificate password saved, use 'Test Certificate Setup' to validate",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                    // Restart server when certificate password changes
+                    restartStreamingServer()
+                    // Returning false prevents EditTextPreference from saving the plaintext
+                    false
+                }
+            }
+
+            // Configure the video recording storage location (defaults to Movies/AndroidIPCamera)
+            findPreference<Preference>("recording_storage_uri")?.apply {
+                summary = recordingStorageSummary()
+                setOnPreferenceClickListener {
+                    val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
+                        addFlags(
+                            Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                                Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
+                                Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
+                        )
+                    }
+                    startActivityForResult(
+                        Intent.createChooser(intent, "Select recording folder"),
+                        PICK_RECORDING_FOLDER
+                    )
+                    true
+                }
+            }
+
+            findPreference<Preference>("reset_recording_storage")?.apply {
+                setOnPreferenceClickListener {
+                    val current = RecordingsHelper.customStorageUri(requireContext())
+                    if (current != null) {
+                        try {
+                            requireContext().contentResolver.releasePersistableUriPermission(
+                                current,
+                                Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                            )
+                        } catch (_: Exception) {
+                            // Permission may already be gone; nothing to release
+                        }
+                    }
+                    PreferenceManager.getDefaultSharedPreferences(requireContext()).edit()
+                        .remove(RecordingsHelper.PREF_RECORDING_STORAGE_URI)
+                        .apply()
+                    findPreference<Preference>("recording_storage_uri")?.summary = recordingStorageSummary()
+                    Toast.makeText(requireContext(),
+                        "Recordings will be saved to ${RecordingsHelper.DEFAULT_RELATIVE_PATH}",
+                        Toast.LENGTH_SHORT).show()
+                    true
+                }
+            }
+
+            // Add test certificate functionality
+            findPreference<Preference>("test_certificate")?.apply {
+                setOnPreferenceClickListener {
+                    val prefs = PreferenceManager.getDefaultSharedPreferences(requireContext())
+                    val certificatePath = prefs.getString("certificate_path", null)
+                    val certPassword = secureStorage.getSecureString(SecureStorage.KEY_CERT_PASSWORD, "")
+
+                    if (certPassword.isNullOrEmpty()) {
+                        Toast.makeText(requireContext(),
+                            "Certificate password not configured, set it above first",
+                            Toast.LENGTH_LONG).show()
+                        return@setOnPreferenceClickListener true
+                    }
+
+                    val isValid = if (certificatePath != null) {
+                        // Test the private copy that the servers actually load.
+                        val privateFile = File(requireContext().filesDir, "certificate.p12")
+                        if (privateFile.exists()) {
+                            InputValidator.validateCertificateFile(privateFile, certPassword)
+                        } else {
+                            val certUri = android.net.Uri.parse(certificatePath)
+                            InputValidator.validateCertificateUsability(requireContext(), certUri, certPassword)
+                        }
+                    } else {
+                        // Test built-in certificate
+                        InputValidator.validateBuiltInCertificate(requireContext(), certPassword)
+                    }
+
+                    if (isValid) {
+                        Toast.makeText(requireContext(),
+                            "✅ Certificate configuration is valid",
+                            Toast.LENGTH_LONG).show()
+                    } else {
+                        Toast.makeText(requireContext(),
+                            "❌ Certificate validation failed, check password and certificate file",
+                            Toast.LENGTH_LONG).show()
+                    }
+
+                    true
+                }
+            }
+
+            // Relay association is created from the relay web page (custom intent link).
+            // Disconnecting forgets the token and stops the outbound WebSocket.
+            findPreference<Preference>("relay_disconnect")?.setOnPreferenceClickListener {
+                AlertDialog.Builder(requireContext())
+                    .setTitle("Disconnect from relay?")
+                    .setMessage("The camera will stop reconnecting and will be removed from the relay. You can pair it again from the relay web page.")
+                    .setPositiveButton("Disconnect") { _, _ ->
+                        requireContext().startService(
+                            Intent(requireContext(), StreamingService::class.java).apply {
+                                action = StreamingService.ACTION_DISCONNECT_RELAY
+                            }
+                        )
+                        Toast.makeText(
+                            requireContext(),
+                            "Removing camera from relay…",
+                            Toast.LENGTH_SHORT
+                        ).show()
+                    }
+                    .setNegativeButton("Cancel", null)
+                    .show()
+                true
+            }
+            refreshRelayPreferences()
+        }
+
+        override fun onResume() {
+            super.onResume()
+            refreshRelayPreferences()
+            PreferenceManager.getDefaultSharedPreferences(requireContext())
+                .registerOnSharedPreferenceChangeListener(relayPreferenceListener)
+        }
+
+        override fun onPause() {
+            PreferenceManager.getDefaultSharedPreferences(requireContext())
+                .unregisterOnSharedPreferenceChangeListener(relayPreferenceListener)
+            super.onPause()
+        }
+
+        private fun isRelayDeleting(prefs: SharedPreferences): Boolean {
+            if (!prefs.getBoolean("relay_deleting", false)) return false
+            val since = prefs.getLong("relay_deleting_since", 0L)
+            val active = since > 0L &&
+                System.currentTimeMillis() - since < RELAY_DELETING_TIMEOUT_MS
+            if (!active) {
+                // The service died or was killed before it could clear the flag.
+                prefs.edit()
+                    .putBoolean("relay_deleting", false)
+                    .remove("relay_deleting_since")
+                    .apply()
+            }
+            return active
+        }
+
+        private fun refreshRelayPreferences() {
+            val context = context ?: return
+            val prefs = PreferenceManager.getDefaultSharedPreferences(context)
+            val deleting = isRelayDeleting(prefs)
+            val credentials = if (deleting) null else RelayAssociation.load(context)
+            val connected = prefs.getBoolean("relay_connected", false)
+            val status = prefs.getString("relay_status", null)
+
+            val relayPreference = findPreference<Preference>("relay_server")
+            val disconnectPreference = findPreference<Preference>("relay_disconnect")
+            val relayCategory = findPreference<PreferenceCategory>("relay_category")
+
+            // Disable the whole relay section while the remote delete is in
+            // flight so the user cannot start another operation.
+            relayCategory?.isEnabled = !deleting
+            relayPreference?.isEnabled = !deleting
+            disconnectPreference?.isEnabled = !deleting
+
+            if (deleting) {
+                relayPreference?.summary = "Removing this camera from the relay…"
+                relayPreference?.setOnPreferenceClickListener(null)
+                relayPreference?.isSelectable = false
+                disconnectPreference?.isVisible = true
+                return
+            }
+
+            // Show the relay URL and connection status in a single preference,
+            // with the status on its own line beneath the URL. Without an
+            // association, the row links to the relay page to start pairing.
+            if (credentials == null) {
+                relayPreference?.summary =
+                    "Not set. Tap to setup or scan the QR code on the relay page"
+                relayPreference?.isSelectable = true
+                relayPreference?.setOnPreferenceClickListener {
+                    startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(RelayAssociation.FALLBACK_SERVER_URL)))
+                    true
+                }
+            } else {
+                val connectionStatus = if (connected) {
+                    status ?: "Connected"
+                } else {
+                    status ?: "Connecting…"
+                }
+                relayPreference?.summary = "${credentials.serverUrl}\n$connectionStatus"
+                relayPreference?.setOnPreferenceClickListener(null)
+                relayPreference?.isSelectable = false
+            }
+            disconnectPreference?.isVisible = credentials != null
+        }
+
+        override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+            if (requestCode == PICK_CERTIFICATE_FILE && resultCode == Activity.RESULT_OK) {
+                data?.data?.let { uri ->
+                    val certificatePath = uri.toString()
+
+                    // Enhanced certificate validation
+                    if (!InputValidator.isValidCertificatePath(requireContext(), certificatePath)) {
+                        Toast.makeText(requireContext(),
+                            "Invalid certificate file, must be a valid .p12 or .pfx file under 10MB",
+                            Toast.LENGTH_LONG).show()
+                        return@let
+                    }
+
+                    // Validate certificate can actually be loaded and used
+                    val secureStorage = SecureStorage(requireContext())
+                    val certPassword = secureStorage.getSecureString(SecureStorage.KEY_CERT_PASSWORD, "")
+                    val certificateUri = Uri.parse(certificatePath)
+
+                    // Keep a private copy so the certificate does not depend on URI permissions
+                    // that may be lost when the app restarts.
+                    val privateFile = File(requireContext().filesDir, "certificate.p12")
+                    try {
+                        requireContext().contentResolver.openInputStream(certificateUri)?.use { input ->
+                            privateFile.outputStream().use { output -> input.copyTo(output) }
+                        } ?: throw IllegalStateException("Unable to open the selected file")
+                    } catch (e: Exception) {
+                        Toast.makeText(
+                            requireContext(),
+                            "Could not store the certificate: ${e.message}",
+                            Toast.LENGTH_LONG
+                        ).show()
+                        return@let
+                    }
+
+                    // Ask for persistable access when the provider supports it. The private copy
+                    // above is what the servers actually use, so failure here is not fatal.
+                    if (uri.scheme == "content") {
+                        try {
+                            requireContext().contentResolver.takePersistableUriPermission(
+                                uri,
+                                Intent.FLAG_GRANT_READ_URI_PERMISSION
+                            )
+                        } catch (_: Exception) {
+                            // Provider does not offer persistable grants; the private copy covers it.
+                        }
+                    }
+
+                    // Store the certificate path
+                    preferenceManager.sharedPreferences?.edit()?.apply {
+                        putString("certificate_path", certificatePath)
+                        apply()
+                    }
+                    // Update the preference summary
+                    findPreference<Preference>("certificate_path")?.summary = certificatePath
+
+                    // A certificate generated on first launch has a random password that the user
+                    // never sees. If the stored password does not unlock the new file, clear it so
+                    // the user is prompted to enter the password for this certificate. Selection
+                    // must not fail just because the password has not been set yet.
+                    val unlocked = !certPassword.isNullOrEmpty() &&
+                        InputValidator.validateCertificateFile(privateFile, certPassword)
+                    if (!unlocked && !certPassword.isNullOrEmpty()) {
+                        secureStorage.removeSecureString(SecureStorage.KEY_CERT_PASSWORD)
+                    }
+
+                    if (unlocked) {
+                        Toast.makeText(
+                            requireContext(),
+                            "Certificate configured, restart the app for changes to take effect",
+                            Toast.LENGTH_SHORT
+                        ).show()
+                    } else {
+                        Toast.makeText(
+                            requireContext(),
+                            "Certificate selected. Set its password in Certificate Password, then use Test Certificate Setup.",
+                            Toast.LENGTH_LONG
+                        ).show()
+                    }
+                }
+            }
+
+            if (requestCode == PICK_RECORDING_FOLDER && resultCode == Activity.RESULT_OK) {
+                data?.data?.let { uri ->
+                    try {
+                        requireContext().contentResolver.takePersistableUriPermission(
+                            uri,
+                            Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                        )
+                        PreferenceManager.getDefaultSharedPreferences(requireContext()).edit()
+                            .putString(RecordingsHelper.PREF_RECORDING_STORAGE_URI, uri.toString())
+                            .apply()
+                        findPreference<Preference>("recording_storage_uri")?.summary = recordingStorageSummary()
+                        Toast.makeText(requireContext(),
+                            "Recording location updated", Toast.LENGTH_SHORT).show()
+                    } catch (e: Exception) {
+                        Toast.makeText(requireContext(),
+                            "Could not use that folder: ${e.message}",
+                            Toast.LENGTH_LONG).show()
+                    }
+                }
+            }
+            super.onActivityResult(requestCode, resultCode, data)
+        }
+
+        /** Summary for the storage preference: the chosen folder name or the default path. */
+        private fun recordingStorageSummary(): String {
+            val uri = RecordingsHelper.customStorageUri(requireContext())
+                ?: return "Default: ${RecordingsHelper.DEFAULT_RELATIVE_PATH}"
+            val name = DocumentFile.fromTreeUri(requireContext(), uri)?.name
+            return "Custom folder: ${name ?: uri}"
+        }
+
+        private fun setRtspOptionsVisible(visible: Boolean) {
+            listOf(RtspServer.PREF_PORT)
+                .forEach { findPreference<Preference>(it)?.isVisible = visible }
+        }
+
+        private fun setOnvifOptionsVisible(visible: Boolean) {
+            listOf(PREF_ONVIF_NAME, PREF_ONVIF_PORT)
+                .forEach { findPreference<Preference>(it)?.isVisible = visible }
+        }
+
+        private fun configuredHttpPort(): Int =
+            preferenceManager.sharedPreferences?.getString("server_port", null)?.toIntOrNull() ?: 4444
+
+        private fun configuredRtspPort(): Int =
+            preferenceManager.sharedPreferences?.getString(RtspServer.PREF_PORT, null)?.toIntOrNull()
+                ?: RtspServer.DEFAULT_PORT
+
+        private fun configuredOnvifPort(): Int =
+            preferenceManager.sharedPreferences?.getString(PREF_ONVIF_PORT, null)?.toIntOrNull() ?: 8000
+
+        private fun isRtspEnabled(): Boolean =
+            preferenceManager.sharedPreferences?.getBoolean(RtspServer.PREF_ENABLED, false) == true
+
+        private fun restartStreamingServer() {
+            val intent = Intent(requireContext(), StreamingService::class.java).apply {
+                action = StreamingService.ACTION_RESTART_SERVER
+            }
+            requireContext().startService(intent)
+            Toast.makeText(requireContext(), "Server restarting...", Toast.LENGTH_SHORT).show()
+        }
+    }
+}

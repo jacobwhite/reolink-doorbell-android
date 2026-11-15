@@ -1,0 +1,2033 @@
+package com.github.digitallyrefined.androidipcamera.helpers
+
+import android.content.Context
+import android.Manifest
+import android.content.pm.PackageManager
+import android.graphics.SurfaceTexture
+import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CameraManager
+import android.media.AudioAttributes
+import android.media.AudioFormat
+import android.media.AudioRecord
+import android.media.AudioTrack
+import android.media.MediaRecorder
+import android.os.Build
+import android.os.Handler
+import android.os.Looper
+import android.util.Base64
+import android.widget.Toast
+import androidx.core.content.ContextCompat
+import androidx.preference.PreferenceManager
+import com.github.digitallyrefined.androidipcamera.helpers.SecureStorage
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
+import java.io.BufferedReader
+import java.io.File
+import java.io.IOException
+import java.io.InputStreamReader
+import java.io.OutputStream
+import java.io.PrintWriter
+import java.net.InetSocketAddress
+import java.net.ServerSocket
+import java.net.Socket
+import java.net.URLDecoder
+import java.nio.charset.StandardCharsets
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.util.Locale
+import kotlin.math.ceil
+import kotlin.math.floor
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CopyOnWriteArrayList
+import org.json.JSONArray
+import org.json.JSONObject
+
+class StreamingServerHelper(
+    private val context: Context,
+    private val streamPort: Int = 4444,
+    private val maxClients: Int = 3,
+    private val maxAuthenticatedClients: Int = 10, // Higher limit for authenticated users
+    private val onLog: (String) -> Unit = {},
+    private val onClientConnected: () -> Unit = {},
+    private val onClientDisconnected: () -> Unit = {},
+    private val onControlCommand: (String, String, Long) -> Unit = { _, _, _ -> },
+    private val onSnapshot: (String) -> ByteArray? = { null },
+    private val onRecordStart: () -> Triple<Boolean, String, String> = { Triple(false, "503 Service Unavailable", """{"error":"unavailable"}""") },
+    private val onRecordStop: () -> Triple<Boolean, String, String> = { Triple(false, "409 Conflict", """{"error":"not_recording"}""") },
+    private val onRecordStatus: () -> String = { """{"recording":false}""" },
+    private val onStreamingEnabledChanged: (Boolean) -> Unit = {}
+) {
+    data class Client(
+        val socket: Socket,
+        val outputStream: OutputStream,
+        val writer: PrintWriter,
+        val connectedAt: Long = System.currentTimeMillis(),
+        val isAuthenticated: Boolean = false,
+        @Volatile var waitingKey: Boolean = true, // H.264: skip frames until first keyframe
+        @Volatile var lastSuccessfulWriteMs: Long = System.currentTimeMillis()
+    ) {
+        fun markWriteSuccess() {
+            lastSuccessfulWriteMs = System.currentTimeMillis()
+        }
+    }
+
+    private data class FailedAttempt(
+        var count: Int = 0,
+        var lastAttempt: Long = 0L,
+        var blockedUntil: Long = 0L
+    )
+
+    private var serverSocket: ServerSocket? = null
+    private var serverJob: Job? = null
+    @Volatile
+    private var isStarting = false
+    private val clients = CopyOnWriteArrayList<Client>()
+    private val h264Clients = CopyOnWriteArrayList<Client>()  // raw H.264 (/h264) viewers
+    private val audioClients = CopyOnWriteArrayList<Socket>()
+    private val failedAttempts = ConcurrentHashMap<String, FailedAttempt>()
+    @Volatile
+    private var appInForeground: Boolean = true
+    @Volatile
+    private var serverGeneration: Long = 0
+
+    // One shared AudioTrack for push-to-talk playback, so packets stream into a single
+    // continuous speaker session instead of one track per request. A watchdog stops it
+    // after a moment of silence, and the next packet lazily re-creates it.
+    private val talkLock = Any()
+    private var talkTrack: AudioTrack? = null
+    private var talkTrackActive = false
+    private var talkLastWriteAt = 0L
+    @Volatile
+    private var talkWatchdogStarted = false
+
+    // SECURITY: Rate limiting constants (only for unauthenticated connections)
+    private val MAX_FAILED_ATTEMPTS = 5  // 5 failed attempts allowed
+    private val BLOCK_DURATION_MS = 15 * 60 * 1000L // 15 minutes block for unauthenticated
+    private val RESET_WINDOW_MS = 10 * 60 * 1000L // 10 minutes reset window
+
+    // Connection limits
+    private val MAX_CONNECTION_DURATION_MS = 30 * 60 * 1000L // 30 minutes max per connection (unauthenticated)
+    private val MAX_AUTHENTICATED_CONNECTION_DURATION_MS = 24 * 60 * 60 * 1000L // 24 hours for authenticated users
+    private val CONNECTION_READ_TIMEOUT_MS = 30 * 1000 // 30 seconds read timeout
+    private val SOCKET_TIMEOUT_MS = 60_000 // 60 seconds socket timeout
+    /** Disconnect streaming clients whose writes have not completed within this window. */
+    private val STALE_WRITE_TIMEOUT_MS = 15_000L
+    private val CONNECTION_CLEANUP_INTERVAL_MS = 60_000L
+    /** Whether the media routes serve at all. The control routes ignore it — see the handler. */
+    private val PREF_STREAMING_ENABLED = "streaming_enabled"
+    /** Wait before restarting a server whose accept loop ended on its own — see scheduleServerRestart. */
+    private val SERVER_RESTART_DELAY_MS = 5_000L
+    /** Hard cap on the whole /video/snapshot request (snapshot() is already internally bounded). */
+    private val SNAPSHOT_TOTAL_WAIT_MS = 14_000L
+    private val SNAPSHOT_MAX_ATTEMPTS = 3
+    private val SNAPSHOT_RETRY_DELAY_MS = 250L
+    /** Max retries when binding the server socket fails (e.g. port still in TIME_WAIT). */
+    private val SOCKET_BIND_MAX_RETRIES = 5
+    /** Base delay between bind retries (exponential backoff: 200, 400, 800, 1600, 3200 ms). */
+    private val SOCKET_BIND_RETRY_DELAY_MS = 200L
+
+    /** GET /files, GET|DELETE /files/<filename> — see [FileManager]. */
+    private val fileManager = FileManager(context, onLog)
+
+    fun getClients(): List<Client> = clients.toList()
+    fun getH264Clients(): List<Client> = h264Clients.toList()
+    fun resetH264Wait() { h264Clients.forEach { it.waitingKey = true } }  // resync viewers at next keyframe
+    fun removeH264Client(client: Client) {
+        if (!h264Clients.remove(client)) return
+        try { client.socket.close() } catch (_: Exception) {}
+        onClientDisconnected()
+    }
+
+    private fun parseQueryParams(uri: String): Map<String, String> {
+        val query = uri.substringAfter("?", missingDelimiterValue = "")
+        if (query.isBlank()) return emptyMap()
+        return query.split("&")
+            .mapNotNull { param ->
+                val parts = param.split("=", limit = 2)
+                if (parts.size != 2) {
+                    null
+                } else {
+                    decodeQueryValue(parts[0]) to decodeQueryValue(parts[1])
+                }
+            }
+            .toMap()
+    }
+
+    private fun decodeQueryValue(value: String): String =
+        try {
+            URLDecoder.decode(value, StandardCharsets.UTF_8.name())
+        } catch (_: Exception) {
+            value
+        }
+
+    fun isStreamingEnabled(): Boolean =
+        PreferenceManager.getDefaultSharedPreferences(context).getBoolean(PREF_STREAMING_ENABLED, true)
+
+    /**
+     * Flips the streaming gate. Turning it off also drops the viewers that are already connected —
+     * otherwise an established MJPEG connection would keep the camera open indefinitely and "off"
+     * would only apply to whoever connected next.
+     */
+    private fun setStreamingEnabled(enabled: Boolean) {
+        PreferenceManager.getDefaultSharedPreferences(context).edit()
+            .putBoolean(PREF_STREAMING_ENABLED, enabled).apply()
+        onLog(if (enabled) "Streaming enabled" else "Streaming disabled")
+        if (!enabled) closeClientConnection()
+        onStreamingEnabledChanged(enabled)
+    }
+
+    /**
+     * Brings the server back after the accept loop ended without anyone asking it to.
+     *
+     * The failure this exists for is silent: the service keeps running with its foreground
+     * notification and the camera still available, but the port is dead, so nothing on the device
+     * looks wrong and the outage is only visible to whoever tries to connect. There is no other
+     * recovery path — the activity only starts the server when it binds, so an app left running in
+     * the background stays dead until it is force-stopped and relaunched by hand.
+     *
+     * A single delayed attempt is enough to keep retrying: if the restart also fails, its own
+     * accept loop ends the same way and schedules the next one, so this backs off at a fixed
+     * interval for as long as the failure lasts.
+     */
+    private fun scheduleServerRestart(generation: Long) {
+        CoroutineScope(Dispatchers.IO).launch {
+            kotlinx.coroutines.delay(SERVER_RESTART_DELAY_MS)
+            val stillStopped = synchronized(this@StreamingServerHelper) { generation == serverGeneration }
+            if (!stillStopped) return@launch  // something already restarted it
+            onLog("Server ended unexpectedly, restarting")
+            startStreamingServer()
+        }
+    }
+
+    fun stopServer() {
+        synchronized(this) {
+            serverGeneration++
+            isStarting = false
+            serverJob?.cancel()
+            serverSocket?.close()
+            serverJob = null
+            serverSocket = null
+        }
+        closeClientConnection()
+    }
+
+    /**
+     * Binds the HTTP(S) listener, retrying while the port is still in TIME_WAIT. TLS sockets come
+     * from the shared [TlsServerConfig] so the web, RTSP and ONVIF endpoints use one certificate.
+     */
+    private fun bindServerSocket(port: Int, tls: TlsServerConfig?): ServerSocket {
+        val bindAddress = ListenInterface.resolve(context)
+        if (!ListenInterface.isAssigned(bindAddress)) {
+            throw IOException(ListenInterface.unavailableMessage(ListenInterface.value(context)))
+        }
+        var lastError: IOException? = null
+        for (attempt in 0..SOCKET_BIND_MAX_RETRIES) {
+            try {
+                return tls?.createServerSocket(port, 50, bindAddress, soTimeout = 30_000) ?: ServerSocket().apply {
+                    reuseAddress = true
+                    soTimeout = 30_000
+                    bind(InetSocketAddress(bindAddress, port), 50)
+                }
+            } catch (e: IOException) {
+                lastError = e
+                val msg = e.message ?: ""
+                val isBindError = msg.contains("Address already in use") ||
+                    msg.contains("BindException") ||
+                    msg.contains("errno = 48") ||
+                    msg.contains("EADDRINUSE")
+                if (!isBindError || attempt == SOCKET_BIND_MAX_RETRIES) throw e
+                val delay = SOCKET_BIND_RETRY_DELAY_MS * (1L shl attempt)
+                onLog("Port $port in use, retrying in ${delay}ms (attempt ${attempt + 1}/$SOCKET_BIND_MAX_RETRIES)")
+                Thread.sleep(delay)
+            }
+        }
+        throw lastError ?: IOException("Failed to create server socket after retries")
+    }
+
+    private fun isRateLimited(clientIp: String): Boolean {
+        val now = System.currentTimeMillis()
+        val attempt = failedAttempts.getOrPut(clientIp) { FailedAttempt() }
+
+        // Check if currently blocked
+        if (now < attempt.blockedUntil) {
+            return true
+        }
+
+        // Reset counter if outside window
+        if (now - attempt.lastAttempt > RESET_WINDOW_MS) {
+            attempt.count = 0
+        }
+
+        return false
+    }
+
+    private fun recordFailedAttempt(clientIp: String) {
+        val now = System.currentTimeMillis()
+        val attempt = failedAttempts.getOrPut(clientIp) { FailedAttempt() }
+
+        // Prevent integer overflow
+        if (attempt.count < Int.MAX_VALUE - 1) {
+            attempt.count++
+        }
+        attempt.lastAttempt = now
+
+        if (attempt.count >= MAX_FAILED_ATTEMPTS) {
+            attempt.blockedUntil = now + BLOCK_DURATION_MS
+            onLog("SECURITY: IP $clientIp blocked for ${BLOCK_DURATION_MS / (60 * 1000)} minutes due to too many unauthenticated attempts")
+        }
+    }
+
+    fun startStreamingServer() {
+        val generation: Long
+        // Prevent concurrent starts
+        synchronized(this) {
+            if (isStarting) {
+                return
+            }
+
+            // Check if server is already running
+            if (serverJob != null && serverSocket != null && !serverSocket!!.isClosed) {
+                return
+            }
+
+            isStarting = true
+            serverGeneration++
+            generation = serverGeneration
+        }
+
+        // Show toast when starting server
+        Handler(Looper.getMainLooper()).post {
+            Toast.makeText(context, "Server starting...", Toast.LENGTH_SHORT).show()
+        }
+
+        // Stop existing server BEFORE creating new one (outside the coroutine)
+        // This must be done to avoid cancelling the new job
+        val oldJob: Job?
+        val oldSocket: ServerSocket?
+        synchronized(this) {
+            oldJob = serverJob
+            oldSocket = serverSocket
+            serverJob = null
+            serverSocket = null
+        }
+
+        // Stop old server and wait for it to fully stop (if it exists)
+        if (oldJob != null || oldSocket != null) {
+            runBlocking(Dispatchers.IO) {
+                try {
+                    oldSocket?.close()
+                } catch (e: IOException) {
+                    onLog("Error closing old server socket: ${e.message}")
+                }
+                oldJob?.cancel()
+                try {
+                    oldJob?.join()
+                } catch (e: Exception) {
+                    // Ignore cancellation exceptions
+                }
+                closeClientConnection()
+                // Small delay to ensure port is released
+                try {
+                    Thread.sleep(500)
+                } catch (e: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                }
+            }
+        }
+
+        synchronized(this) {
+              serverJob = CoroutineScope(Dispatchers.IO).launch {
+              var localServerSocket: ServerSocket? = null
+              // Only set once the socket is live and published, so a server that never managed to
+              // bind (bad certificate, port in use) is not retried forever by the supervisor below.
+              var serverWasPublished = false
+              try {
+                  val prefs = PreferenceManager.getDefaultSharedPreferences(context)
+                  val port = prefs.getString("server_port", null)?.toIntOrNull()?.takeIf { it in 1..65535 } ?: streamPort
+
+                  // The same TLS material is shared with RTSP and ONVIF (see TlsHelper).
+                  val tlsConfig = try {
+                      TlsHelper.serverConfig(context) { onLog(it) }
+                  } catch (e: Exception) {
+                      Handler(Looper.getMainLooper()).post {
+                          onLog("Certificate loading failed: ${e.message}")
+                          val errorMsg = when {
+                              e.message?.contains("password") == true ->
+                                  "Certificate password is incorrect, check Settings > Advanced Security"
+                              e.message?.contains("keystore") == true ->
+                                  "Certificate file is corrupted or invalid, regenerate with setup.bat"
+                              else ->
+                                  "Certificate error: ${e.message}"
+                          }
+                          Toast.makeText(context, errorMsg, Toast.LENGTH_LONG).show()
+                      }
+                      return@launch
+                  }
+
+                  val createdServerSocket = try {
+                      bindServerSocket(port, tlsConfig)
+                  } catch (e: Exception) {
+                      Handler(Looper.getMainLooper()).post {
+                          onLog("CRITICAL: Failed to create server: ${e.message}")
+                          Toast.makeText(context, "Failed to start server: ${e.message}", Toast.LENGTH_LONG).show()
+                      }
+                      return@launch
+                  }
+                  localServerSocket = createdServerSocket
+                  val published = synchronized(this@StreamingServerHelper) {
+                      if (generation != serverGeneration || !isActive) false
+                      else {
+                          serverSocket = createdServerSocket
+                          true
+                      }
+                  }
+                  if (!published) return@launch
+
+                  serverWasPublished = true
+                  onLog("Server started on port $port (${if (tlsConfig != null) "HTTPS" else "HTTP"})")
+                  // Clear the starting flag now that server is running
+                  synchronized(this@StreamingServerHelper) {
+                      if (generation == serverGeneration) isStarting = false
+                  }
+                  Handler(Looper.getMainLooper()).post {
+                      Toast.makeText(context, "Server started", Toast.LENGTH_SHORT).show()
+                  }
+                  var lastConnectionCleanupMs = 0L
+                  while (isActive && !Thread.currentThread().isInterrupted) {
+                      try {
+                          val now = System.currentTimeMillis()
+                          if (now - lastConnectionCleanupMs >= CONNECTION_CLEANUP_INTERVAL_MS) {
+                              cleanupExpiredConnections()
+                              lastConnectionCleanupMs = now
+                          }
+                          val socket = createdServerSocket.accept()
+                          val clientIp = socket.inetAddress.hostAddress
+
+                          // Handle each connection in a separate coroutine to avoid blocking the accept loop
+                          CoroutineScope(Dispatchers.IO).launch {
+                              handleClientConnection(socket, clientIp, generation)
+                          }
+                      } catch (e: IOException) {
+                          // Check if server socket was closed
+                          if (createdServerSocket.isClosed) {
+                              onLog("Server socket closed, stopping server")
+                              break
+                          }
+                          // Ignore other connection errors
+                      } catch (e: InterruptedException) {
+                          Thread.currentThread().interrupt()
+                          break
+                      } catch (e: Exception) {
+                          // Check if server socket was closed
+                          if (createdServerSocket.isClosed) {
+                              onLog("Server socket closed, stopping server")
+                              break
+                          }
+                          onLog("Unexpected error in server loop: ${e.message}")
+                      }
+                  }
+              } catch (e: IOException) {
+                  onLog("Could not start server: ${e.message}")
+              } finally {
+                  try { localServerSocket?.close() } catch (_: IOException) {}
+                  val endedOnItsOwn = synchronized(this@StreamingServerHelper) {
+                      if (serverSocket === localServerSocket) serverSocket = null
+                      if (generation == serverGeneration) isStarting = false
+                      // stopServer() and every new start bump serverGeneration. If it is still
+                      // ours, nobody asked this loop to end — the socket was closed underneath it
+                      // or an exception escaped — and nothing else will bring the server back.
+                      generation == serverGeneration
+                  }
+                  if (serverWasPublished && endedOnItsOwn) scheduleServerRestart(generation)
+              }
+            }
+        }
+    }
+
+    private suspend fun handleClientConnection(socket: Socket, clientIp: String, generation: Long) {
+        try {
+            val outputStream = socket.getOutputStream()
+            val writer = PrintWriter(outputStream, true)
+
+            // Configure socket timeouts for security and faster detection of stalled clients
+            socket.soTimeout = SOCKET_TIMEOUT_MS
+            socket.keepAlive = true
+            try {
+                socket.tcpNoDelay = true
+                if (DeviceMemoryHelper.isLowRamDevice(context)) {
+                    socket.sendBufferSize = 32 * 1024
+                }
+            } catch (_: Exception) {
+            }
+
+            // ISO-8859-1 is byte-preserving (1 byte == 1 char), which lets the same reader
+            // safely decode binary request bodies (e.g. chunked PCM audio) after the headers.
+            val reader = BufferedReader(InputStreamReader(socket.getInputStream(), StandardCharsets.ISO_8859_1))
+
+            // Read the request line (e.g., GET /video/mjpeg HTTP/1.1)
+            val requestLine = reader.readLine() ?: return
+            val requestParts = requestLine.split(" ")
+            if (requestParts.size < 2) return
+            val httpMethod = requestParts[0].uppercase(Locale.US)
+            val uri = requestParts[1]
+            val path = uri.substringBefore('?')
+
+            val secureStorage = SecureStorage(context)
+            val rawUsername = secureStorage.getSecureString(SecureStorage.KEY_USERNAME, "") ?: ""
+            val rawPassword = secureStorage.getSecureString(SecureStorage.KEY_PASSWORD, "") ?: ""
+
+            // Check if authentication is enabled
+            val prefs = PreferenceManager.getDefaultSharedPreferences(context)
+            val enableAuth = prefs.getBoolean("enable_auth", true)
+
+            // Validate stored credentials if auth is enabled
+            val username = if (enableAuth) {
+                InputValidator.validateAndSanitizeUsername(rawUsername)
+            } else {
+                null
+            }
+            val password = if (enableAuth) {
+                InputValidator.validateAndSanitizePassword(rawPassword)
+            } else {
+                null
+            }
+
+            if (enableAuth) {
+                if (username == null || password == null || username.isEmpty() || password.isEmpty()) {
+                    // CRITICAL: No valid credentials configured - reject all connections
+                    recordFailedAttempt(clientIp)
+                    writer.print("HTTP/1.1 403 Forbidden\r\n")
+                    writer.print("Content-Type: text/plain\r\n")
+                    writer.print("Connection: close\r\n\r\n")
+                    writer.print("SECURITY ERROR: Authentication credentials not properly configured.\r\n")
+                    writer.print("Configure username and password in app settings.\r\n")
+                    writer.flush()
+                    socket.close()
+                    onLog("SECURITY: Connection rejected - authentication credentials not configured")
+                    return
+                }
+            }
+
+            // Read HTTP headers
+            val headers = mutableListOf<String>()
+            var line: String?
+            while (reader.readLine().also { line = it } != null) {
+                if (line.isNullOrEmpty()) break
+                headers.add(line!!)
+            }
+
+            // SECURITY: Require Basic Authentication header for all requests (when auth is enabled)
+            // Parse headers in a robust, case-insensitive way (RFC 7230: header field names are case-insensitive)
+            val authHeaderPair = headers.mapNotNull { hdr ->
+                val idx = hdr.indexOf(":")
+                if (idx == -1) return@mapNotNull null
+                val name = hdr.substring(0, idx).trim()
+                val value = hdr.substring(idx + 1).trim()
+                name to value
+            }.find { (name, value) ->
+                name.equals("Authorization", ignoreCase = true) && value.startsWith("Basic ", ignoreCase = true)
+            }
+
+            if (enableAuth) {
+                if (authHeaderPair == null) {
+                    // Rate limiting ONLY applies to unauthenticated requests
+                    if (isRateLimited(clientIp)) {
+                        writer.print("HTTP/1.1 429 Too Many Requests\r\n")
+                        writer.print("Retry-After: 30\r\n") // Reduced to 30 seconds for unauthenticated
+                        writer.print("Connection: close\r\n\r\n")
+                        writer.flush()
+                        socket.close()
+                        onLog("SECURITY: Rate limited unauthenticated request from $clientIp")
+                        Thread.sleep(100)
+                        return
+                    }
+                    recordFailedAttempt(clientIp)
+                    writer.print("HTTP/1.1 401 Unauthorized\r\n")
+                    writer.print("WWW-Authenticate: Basic realm=\"Android IP Camera\"\r\n")
+                    writer.print("Connection: close\r\n\r\n")
+                    writer.print("Unauthorized. Check username and password in the app settings.\r\n")
+                    writer.flush()
+                    socket.close()
+                    return
+                }
+
+                val authValue = authHeaderPair.second
+                val providedAuthEncoded = authValue.substringAfter("Basic ", "")
+                val providedAuth = try {
+                    val decoded = Base64.decode(providedAuthEncoded, Base64.DEFAULT)
+                    String(decoded)
+                } catch (e: IllegalArgumentException) {
+                    // Malformed base64
+                    if (isRateLimited(clientIp)) {
+                        writer.print("HTTP/1.1 429 Too Many Requests\r\n")
+                        writer.print("Retry-After: 30\r\n")
+                        writer.print("Connection: close\r\n\r\n")
+                        writer.flush()
+                        socket.close()
+                        onLog("SECURITY: Rate limited malformed auth attempt from $clientIp")
+                        Thread.sleep(100)
+                        return
+                    }
+                    recordFailedAttempt(clientIp)
+                    writer.print("HTTP/1.1 401 Unauthorized\r\n")
+                    writer.print("Connection: close\r\n\r\n")
+                    writer.print("Unauthorized. Check username and password in the app settings.\r\n")
+                    writer.flush()
+                    socket.close()
+                    onLog("SECURITY: Failed authentication attempt from $clientIp (malformed base64)")
+                    return
+                }
+
+                if (providedAuth != "$username:$password") {
+                    // Rate limiting ONLY applies to failed authentication attempts
+                    if (isRateLimited(clientIp)) {
+                        writer.print("HTTP/1.1 429 Too Many Requests\r\n")
+                        writer.print("Retry-After: 30\r\n") // Reduced to 30 seconds for failed auth
+                        writer.print("Connection: close\r\n\r\n")
+                        writer.flush()
+                        socket.close()
+                        onLog("SECURITY: Rate limited failed auth attempt from $clientIp")
+                        Thread.sleep(100)
+                        return
+                    }
+                    recordFailedAttempt(clientIp)
+                    writer.print("HTTP/1.1 401 Unauthorized\r\n")
+                    writer.print("Connection: close\r\n\r\n")
+                    writer.print("Unauthorized. Check username and password in the app settings.\r\n")
+                    writer.flush()
+                    socket.close()
+                    onLog("SECURITY: Failed authentication attempt from $clientIp")
+                    return
+                }
+            }
+
+            // Handle Control UI and Commands
+            if (uri == "/" || uri == "") {
+                val htmlResponse = try {
+                    context.assets.open("index.html").bufferedReader().use { it.readText() }
+                } catch (e: Exception) {
+                    "<html><body>Error loading interface.</body></html>"
+                }
+
+                writer.print("HTTP/1.1 200 OK\r\n")
+                writer.print("Content-Type: text/html\r\n")
+                writer.print("Connection: close\r\n\r\n")
+                writer.print(htmlResponse)
+                writer.flush()
+                socket.close()
+                return
+            }
+
+            // Streaming on/off, so a home-automation system can stop the camera serving without
+            // needing access to the device. Deliberately does NOT close the listening socket:
+            // shutting the port would make /control/start unreachable and turning the camera back
+            // on would need physical access. Only the media routes are refused.
+            if (path.startsWith("/control/")) {
+                when (path) {
+                    "/control/start" -> setStreamingEnabled(true)
+                    "/control/stop" -> setStreamingEnabled(false)
+                    "/control/status" -> {}
+                    else -> {
+                        writer.print("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n")
+                        writer.flush()
+                        try { socket.close() } catch (_: Exception) {}
+                        return
+                    }
+                }
+                writer.print("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n")
+                writer.print("{\"streaming\":${isStreamingEnabled()}}")
+                writer.flush()
+                try { socket.close() } catch (_: Exception) {}
+                return
+            }
+
+            if (!isStreamingEnabled() &&
+                (path.startsWith("/video") || path == "/audio" || path == "/audio/raw" || path == "/audio/upload")
+            ) {
+                writer.print("HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n")
+                writer.print("Streaming is disabled. POST /control/start to re-enable.\r\n")
+                writer.flush()
+                try { socket.close() } catch (_: Exception) {}
+                return
+            }
+
+            if (path == "/video/snapshot") {
+                // One JPEG captured into RAM (no disk). ?camera=<id>. For polling / dual-camera views.
+                val id = parseQueryParams(uri)["camera"] ?: ""
+
+                // snapshot() is internally bounded (never returns stale images); retry briefly to ride
+                // out a transient camera restart, but never let the request hang past the total cap.
+                val deadline = System.currentTimeMillis() + SNAPSHOT_TOTAL_WAIT_MS
+                var jpeg = onSnapshot(id)
+                var attempt = 0
+                while (jpeg == null && attempt < SNAPSHOT_MAX_ATTEMPTS &&
+                    System.currentTimeMillis() < deadline && !socket.isClosed) {
+                    attempt++
+                    try {
+                        kotlinx.coroutines.delay(SNAPSHOT_RETRY_DELAY_MS)
+                    } catch (_: Exception) {
+                        // If coroutine is cancelled or interrupted, stop retrying
+                        break
+                    }
+                    jpeg = onSnapshot(id)
+                }
+
+                if (jpeg != null) {
+                    writer.print("HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\n")
+                    writer.print("Content-Length: ${jpeg.size}\r\n")
+                    writer.print("Cache-Control: no-store, no-cache, must-revalidate, max-age=0\r\n")
+                    writer.print("Pragma: no-cache\r\n")
+                    writer.print("Expires: 0\r\n")
+                    writer.print("Connection: close\r\n\r\n")
+                    writer.flush(); outputStream.write(jpeg); outputStream.flush()
+                } else {
+                    writer.print("HTTP/1.1 503 Service Unavailable\r\n")
+                    writer.print("Content-Type: text/plain\r\n")
+                    writer.print("Cache-Control: no-store\r\nConnection: close\r\n\r\nno frame"); writer.flush()
+                }
+                try { socket.close() } catch (_: Exception) {}
+                return
+            }
+
+            // ---- Recording endpoints ----
+            if (path == "/record/start" && requestParts[0] == "POST") {
+                val (_, status, json) = onRecordStart()
+                writer.print("HTTP/1.1 $status\r\n")
+                writer.print("Content-Type: application/json\r\n")
+                writer.print("Connection: close\r\n\r\n")
+                writer.print(json)
+                writer.flush()
+                try { socket.close() } catch (_: Exception) {}
+                return
+            }
+
+            if (path == "/record/stop" && requestParts[0] == "POST") {
+                val (_, status, json) = onRecordStop()
+                writer.print("HTTP/1.1 $status\r\n")
+                writer.print("Content-Type: application/json\r\n")
+                writer.print("Connection: close\r\n\r\n")
+                writer.print(json)
+                writer.flush()
+                try { socket.close() } catch (_: Exception) {}
+                return
+            }
+
+            if (path == "/record/status") {
+                val json = onRecordStatus()
+                writer.print("HTTP/1.1 200 OK\r\n")
+                writer.print("Content-Type: application/json\r\n")
+                writer.print("Connection: close\r\n\r\n")
+                writer.print(json)
+                writer.flush()
+                try { socket.close() } catch (_: Exception) {}
+                return
+            }
+
+            // ---- Recorded files endpoints (Movies/AndroidIPCamera or the custom folder) ----
+            if (fileManager.handleRequest(httpMethod, path, uri, headers, writer, outputStream)) {
+                try { socket.close() } catch (_: Exception) {}
+                return
+            }
+
+            if (uri.contains("?")) {
+                val params = parseQueryParams(uri)
+                val ts = params["ts"]?.toLongOrNull() ?: 0L // for ordering; 0 = none
+
+                // Support a single-shot reset command: ?resetCamera=<id>
+                val resetId = params["resetCamera"]
+                if (!resetId.isNullOrBlank()) {
+                    try {
+                        resetCameraPreferences(resetId)
+                    } catch (e: Exception) {
+                        onLog("Error resetting camera prefs for $resetId: ${e.message}")
+                    }
+                    writer.print("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nOK")
+                    writer.flush()
+                    socket.close()
+                    return
+                }
+
+                params.forEach { (key, value) ->
+                    if (key == "ts") return@forEach
+                    onControlCommand(key, value, ts)
+                }
+                writer.print("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nOK")
+                writer.flush()
+                socket.close()
+                return
+            }
+
+            if (path == "/audio" || path == "/audio/raw") {
+                if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                    writer.print("HTTP/1.1 403 Forbidden\r\n")
+                    writer.print("Content-Type: text/plain\r\n")
+                    writer.print("Connection: close\r\n\r\n")
+                    writer.print("Microphone permission not granted.\r\n")
+                    writer.flush()
+                    try { socket.close() } catch (_: Exception) {}
+                    return
+                }
+                val accepted = synchronized(this) {
+                    if (generation != serverGeneration) false
+                    else { audioClients.add(socket); true }
+                }
+                if (!accepted) {
+                    try { socket.close() } catch (_: Exception) {}
+                    return
+                }
+                try {
+                    writer.print("HTTP/1.1 200 OK\r\n")
+                    writer.print("Connection: keep-alive\r\n")
+                    writer.print("Cache-Control: no-cache, no-store, must-revalidate\r\n")
+                    writer.print("Pragma: no-cache\r\n")
+                    writer.print("Expires: 0\r\n")
+                    writer.print("Content-Type: audio/wav\r\n")
+                    writer.print("Transfer-Encoding: chunked\r\n\r\n")
+                    writer.flush()
+
+                    val sampleRate = 44100
+                    val channelConfig = AudioFormat.CHANNEL_IN_MONO
+                    val audioFormat = AudioFormat.ENCODING_PCM_16BIT
+                    val minBuffer = AudioRecord.getMinBufferSize(sampleRate, channelConfig, audioFormat)
+                    if (minBuffer <= 0) {
+                        throw IOException("Invalid AudioRecord buffer size: $minBuffer")
+                    }
+                    val bufferSize = minBuffer * 2
+                    val rawAudio = path == "/audio/raw"
+                    // UNPROCESSED is a hint; many HALs (especially on API 24-28) don't
+                    // implement it and the AudioRecord ctor throws IllegalArgumentException.
+                    // Fall back to the plain MIC source in that case.
+                    val audioRecord = if (rawAudio && Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                        try {
+                            AudioRecord(
+                                MediaRecorder.AudioSource.UNPROCESSED,
+                                sampleRate,
+                                channelConfig,
+                                audioFormat,
+                                bufferSize
+                            )
+                        } catch (e: IllegalArgumentException) {
+                            onLog("UNPROCESSED audio source unsupported, falling back to MIC")
+                            AudioRecord(
+                                MediaRecorder.AudioSource.MIC,
+                                sampleRate,
+                                channelConfig,
+                                audioFormat,
+                                bufferSize
+                            )
+                        }
+                    } else {
+                        AudioRecord(
+                            MediaRecorder.AudioSource.MIC,
+                            sampleRate,
+                            channelConfig,
+                            audioFormat,
+                            bufferSize
+                        )
+                    }
+
+                    val wavHeader = createWavHeader(
+                        sampleRate = sampleRate,
+                        bitsPerSample = 16,
+                        channels = 1
+                    )
+                    writeChunk(outputStream, wavHeader, wavHeader.size)
+
+                    audioRecord.startRecording()
+                    val pcmBuffer = ByteArray(bufferSize)
+                    val audioPrefs = PreferenceManager.getDefaultSharedPreferences(context)
+                    try {
+                        while (socket.isConnected && !socket.isClosed && appInForeground) {
+                            val read = audioRecord.read(pcmBuffer, 0, pcmBuffer.size)
+                            if (read <= 0) continue
+
+                            // Read audio gain dynamically to allow real-time changes
+                            val audioGain = audioPrefs.getString("audio_gain", "1.0")?.toFloatOrNull() ?: 1.0f
+
+                            // Apply audio gain if not 1.0
+                            val processedBuffer = if (audioGain != 1.0f) {
+                                applyAudioGain(pcmBuffer, read, audioGain)
+                            } else {
+                                pcmBuffer
+                            }
+
+                            try {
+                                writeChunk(outputStream, processedBuffer, read)
+                            } catch (e: java.net.SocketTimeoutException) {
+                                // Handle slow network - client is not reading fast enough
+                                onLog("Audio stream timeout: ${e.message}")
+                                break
+                            } catch (e: IOException) {
+                                // Network error - client disconnected or network issue
+                                onLog("Audio stream IO error: ${e.message}")
+                                break
+                            }
+                        }
+                    } finally {
+                        try {
+                            audioRecord.stop()
+                        } catch (_: Exception) {
+                        }
+                        audioRecord.release()
+                        try {
+                            outputStream.write("0\r\n\r\n".toByteArray())
+                            outputStream.flush()
+                        } catch (_: Exception) {
+                        }
+                        try {
+                            socket.close()
+                        } catch (_: Exception) {
+                        }
+                    }
+                } catch (sec: SecurityException) {
+                    writer.print("HTTP/1.1 403 Forbidden\r\n")
+                    writer.print("Content-Type: text/plain\r\n")
+                    writer.print("Connection: close\r\n\r\n")
+                    writer.print("Microphone permission not granted.\r\n")
+                    writer.flush()
+                    try { socket.close() } catch (_: Exception) {}
+                } catch (e: Exception) {
+                    onLog("Audio stream error: ${e.message}")
+                    try {
+                        writer.print("HTTP/1.1 500 Internal Server Error\r\n")
+                        writer.print("Content-Type: text/plain\r\n")
+                        writer.print("Connection: close\r\n\r\n")
+                        writer.print("Audio streaming failed.\r\n")
+                        writer.flush()
+                    } catch (_: Exception) {
+                    } finally {
+                        try { socket.close() } catch (_: Exception) {}
+                    }
+                } finally {
+                    audioClients.remove(socket)
+                    try { socket.close() } catch (_: Exception) {}
+                }
+                return
+            }
+
+            // ---- Push-to-talk: browser streams mic PCM to the phone's speaker ----
+            if (path == "/audio/upload" && httpMethod == "POST") {
+                val headerMap = headers.mapNotNull { hdr ->
+                    val idx = hdr.indexOf(":")
+                    if (idx == -1) return@mapNotNull null
+                    hdr.substring(0, idx).trim().lowercase() to hdr.substring(idx + 1).trim()
+                }.toMap()
+                if (headerMap["expect"]?.contains("100-continue", ignoreCase = true) == true) {
+                    writer.print("HTTP/1.1 100 Continue\r\n\r\n")
+                    writer.flush()
+                }
+                val contentLength = headerMap["content-length"]?.toIntOrNull()
+                val chunked = headerMap["transfer-encoding"]?.contains("chunked", ignoreCase = true) == true
+                handleTalkUpload(socket, reader, writer, contentLength, chunked)
+                return
+            }
+
+            if (path == "/info.json") {
+                val info = buildDeviceInfo()
+                writer.print("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n")
+                writer.print(info.toJsonString()); writer.flush()
+                try { socket.close() } catch (_: Exception) {}
+                return
+            }
+
+            if (path == "/video/h264") {
+                // Raw Annex-B H.264 elementary stream (hardware-encoded). Browser plays via jMuxer.
+                if (handleMaxH264Clients(socket, isAuthenticated = enableAuth)) return
+                writer.print("HTTP/1.1 200 OK\r\n")
+                writer.print("Connection: keep-alive\r\n")
+                writer.print("Cache-Control: no-cache, no-store, must-revalidate\r\n")
+                writer.print("Content-Type: video/h264\r\n\r\n")
+                writer.flush()
+                val client = Client(socket, outputStream, writer, System.currentTimeMillis(), isAuthenticated = enableAuth)
+                val accepted = synchronized(this) {
+                    if (generation != serverGeneration) false
+                    else { h264Clients.add(client); true }
+                }
+                if (!accepted) {
+                    try { socket.close() } catch (_: Exception) {}
+                    return
+                }
+                onClientConnected()  // starts camera + encoder
+                try {
+                    while (socket.isConnected && !socket.isClosed) {
+                        if (reader.ready()) { if (reader.readLine() == null) break }
+                        Thread.sleep(1000)
+                    }
+                } catch (_: Exception) {
+                } finally {
+                    removeH264Client(client)
+                }
+                return
+            }
+
+            if (path == "/video/mjpeg") {
+                // AUTHENTICATED CONNECTION if auth is enabled - No rate limiting, higher connection limits
+                if (handleMaxClients(socket, isAuthenticated = enableAuth)) return
+
+                // Send HTTP response headers for MJPEG stream
+                // Use HTTP/1.1 with keep-alive for better streaming performance
+                writer.print("HTTP/1.1 200 OK\r\n")
+                writer.print("Connection: keep-alive\r\n")
+                writer.print("Cache-Control: no-cache, no-store, must-revalidate\r\n")
+                writer.print("Pragma: no-cache\r\n")
+                writer.print("Expires: 0\r\n")
+                writer.print("Content-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n")
+                writer.flush()
+
+                // Add client to list - frames will be sent from MainActivity.processImage()
+                val client = Client(socket, outputStream, writer, System.currentTimeMillis(), isAuthenticated = enableAuth)
+                val accepted = synchronized(this) {
+                    if (generation != serverGeneration) false
+                    else { clients.add(client); true }
+                }
+                if (!accepted) {
+                    try { socket.close() } catch (_: Exception) {}
+                    return
+                }
+                onClientConnected()
+
+                // Keep connection alive - frames will be sent from MainActivity.processImage()
+                // Wait for connection to close or be removed
+                try {
+                    // Read from socket to detect when client disconnects
+                    while (socket.isConnected && !socket.isClosed) {
+                        // Check if socket has data (client disconnect will cause exception)
+                        if (reader.ready()) {
+                            val line = reader.readLine()
+                            if (line == null) break // Client disconnected
+                        }
+                        Thread.sleep(1000) // Check every second
+                    }
+                } catch (e: IOException) {
+                    // Client disconnected
+                } finally {
+                    removeClient(client)
+                }
+            } else {
+                writer.print("HTTP/1.1 404 Not Found\r\n")
+                writer.print("Content-Type: text/plain\r\n")
+                writer.print("Connection: close\r\n\r\n")
+                writer.print("Not Found\r\n")
+                writer.flush()
+                try {
+                    socket.close()
+                } catch (_: Exception) {
+                }
+            }
+        } catch (e: Exception) {
+            onLog("Error handling client connection from $clientIp: ${e.message}")
+            try {
+                socket.close()
+            } catch (closeException: Exception) {
+                // Ignore
+            }
+        }
+    }
+
+    private fun createWavHeader(sampleRate: Int, bitsPerSample: Int, channels: Int): ByteArray {
+        val byteRate = sampleRate * channels * bitsPerSample / 8
+        val blockAlign = (channels * bitsPerSample / 8).toShort()
+        val dataChunkSize = 0x7FFFFFFF // Placeholder large size for live stream
+        val riffChunkSize = 36 + dataChunkSize
+
+        val buffer = ByteBuffer.allocate(44).order(ByteOrder.LITTLE_ENDIAN)
+        buffer.put("RIFF".toByteArray(Charsets.US_ASCII))
+        buffer.putInt(riffChunkSize)
+        buffer.put("WAVE".toByteArray(Charsets.US_ASCII))
+        buffer.put("fmt ".toByteArray(Charsets.US_ASCII))
+        buffer.putInt(16) // Subchunk1Size for PCM
+        buffer.putShort(1) // AudioFormat PCM
+        buffer.putShort(channels.toShort())
+        buffer.putInt(sampleRate)
+        buffer.putInt(byteRate)
+        buffer.putShort(blockAlign)
+        buffer.putShort(bitsPerSample.toShort())
+        buffer.put("data".toByteArray(Charsets.US_ASCII))
+        buffer.putInt(dataChunkSize)
+        return buffer.array()
+    }
+
+    private fun writeChunk(outputStream: OutputStream, data: ByteArray, length: Int) {
+        val header = length.toString(16) + "\r\n"
+        outputStream.write(header.toByteArray())
+        outputStream.write(data, 0, length)
+        outputStream.write("\r\n".toByteArray())
+        outputStream.flush()
+    }
+
+    private fun applyAudioGain(buffer: ByteArray, length: Int, gain: Float): ByteArray {
+        // Process 16-bit PCM samples (2 bytes per sample, little-endian)
+        val result = ByteArray(length)
+        for (i in 0 until length step 2) {
+            if (i + 1 >= length) break
+            // Convert little-endian bytes to short
+            val sample = ((buffer[i + 1].toInt() shl 8) or (buffer[i].toInt() and 0xFF)).toShort()
+            // Apply gain and clamp to prevent overflow
+            val amplified = (sample * gain).toInt().coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt())
+            // Convert back to little-endian bytes
+            result[i] = (amplified and 0xFF).toByte()
+            result[i + 1] = ((amplified shr 8) and 0xFF).toByte()
+        }
+        return result
+    }
+
+    /**
+     * Push-to-talk upload: the web UI sends the browser-microphone 16-bit PCM (mono, 44.1 kHz)
+     * as fixed-size POST packets with Content-Length (Chrome refuses streamed upload bodies over
+     * HTTP/1.x). Each packet is appended to one shared [AudioTrack] and the response is sent
+     * immediately, so the browser stays ahead of playback (no growing latency). The blocking
+     * AudioTrack.write() provides natural back-pressure and keeps the phone's speaker in sync.
+     */
+    private fun handleTalkUpload(
+        socket: Socket,
+        reader: BufferedReader,
+        writer: PrintWriter,
+        contentLength: Int?,
+        chunked: Boolean
+    ) {
+        var headersSent = false
+        try {
+            ensureTalkWatchdog()
+            val completed: Boolean
+            if (chunked || contentLength == null) {
+                completed = readChunkedBody(reader) { chunk -> writeTalkBytes(chunk) }
+            } else {
+                var remaining = contentLength
+                val charBuf = CharArray(8192)
+                var clean = true
+                while (remaining > 0 && clean) {
+                    val want = minOf(charBuf.size, remaining)
+                    val n = reader.read(charBuf, 0, want)
+                    if (n <= 0) {
+                        clean = false
+                        break
+                    }
+                    val chunk = ByteArray(n)
+                    for (i in 0 until n) chunk[i] = charBuf[i].code.toByte()
+                    remaining -= n
+                    clean = writeTalkBytes(chunk)
+                }
+                completed = clean && remaining <= 0
+            }
+            if (completed) {
+                writer.print("HTTP/1.1 200 OK\r\n")
+                writer.print("Connection: close\r\n")
+                writer.print("Content-Type: text/plain\r\n\r\n")
+                writer.print("OK\r\n")
+                writer.flush()
+                headersSent = true
+            } else {
+                onLog("Talk: packet dropped (incomplete body)")
+            }
+        } catch (e: Exception) {
+            onLog("Talk upload error: ${e.message}")
+            if (!headersSent) {
+                try {
+                    writer.print("HTTP/1.1 500 Internal Server Error\r\n")
+                    writer.print("Content-Type: text/plain\r\n")
+                    writer.print("Connection: close\r\n\r\n")
+                    writer.print("Talk streaming failed.\r\n")
+                    writer.flush()
+                } catch (_: Exception) {
+                }
+            }
+        } finally {
+            try {
+                socket.close()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    private fun writeTalkBytes(chunk: ByteArray): Boolean {
+        return synchronized(talkLock) {
+            try {
+                if (talkTrack == null) {
+                    val minBuf = AudioTrack.getMinBufferSize(
+                        44100,
+                        AudioFormat.CHANNEL_OUT_MONO,
+                        AudioFormat.ENCODING_PCM_16BIT
+                    )
+                    if (minBuf <= 0) {
+                        onLog("Talk: invalid AudioTrack min buffer ($minBuf)")
+                        return@writeTalkBytes false
+                    }
+                    val track = AudioTrack.Builder()
+                        .setAudioAttributes(
+                            AudioAttributes.Builder()
+                                .setUsage(AudioAttributes.USAGE_MEDIA)
+                                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                                .build()
+                        )
+                        .setAudioFormat(
+                            AudioFormat.Builder()
+                                .setSampleRate(44100)
+                                .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                                .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                                .build()
+                        )
+                        .setBufferSizeInBytes(maxOf(minBuf * 2, 88 * 1024))
+                        .setTransferMode(AudioTrack.MODE_STREAM)
+                        .build()
+                    if (track.state != AudioTrack.STATE_INITIALIZED) {
+                        track.release()
+                        onLog("Talk: AudioTrack could not be initialized (no audio output available)")
+                        return@writeTalkBytes false
+                    }
+                    talkTrack = track
+                }
+                val track = talkTrack!!
+                if (!talkTrackActive) {
+                    track.play()
+                    talkTrackActive = true
+                }
+                var off = 0
+                while (off < chunk.size) {
+                    val written = track.write(chunk, off, chunk.size - off)
+                    if (written <= 0) {
+                        onLog("Talk: AudioTrack.write returned $written")
+                        return@writeTalkBytes false
+                    }
+                    off += written
+                }
+                talkLastWriteAt = System.currentTimeMillis()
+                true
+            } catch (e: Exception) {
+                onLog("Talk: AudioTrack write error: ${e.message}")
+                false
+            }
+        }
+    }
+
+    private fun ensureTalkWatchdog() {
+        if (talkWatchdogStarted) return
+        synchronized(talkLock) {
+            if (talkWatchdogStarted) return
+            talkWatchdogStarted = true
+        }
+        Thread {
+            try {
+                while (true) {
+                    try {
+                        Thread.sleep(500)
+                    } catch (_: InterruptedException) {
+                        break
+                    }
+                    if (talkLastWriteAt != 0L && System.currentTimeMillis() - talkLastWriteAt > 1500) {
+                        synchronized(talkLock) {
+                            if (System.currentTimeMillis() - talkLastWriteAt > 1500) {
+                                talkLastWriteAt = 0L
+                                try {
+                                    talkTrack?.stop()
+                                } catch (_: Exception) {
+                                }
+                                try {
+                                    talkTrack?.release()
+                                } catch (_: Exception) {
+                                }
+                                talkTrack = null
+                                talkTrackActive = false
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {
+            }
+        }.also { it.isDaemon = true }.start()
+    }
+
+    /**
+     * Reads a chunked transfer-encoded HTTP request body (RFC 7230 §4.1), handing each decoded
+     * chunk to [onChunk]. Returns false if the stream ended uncleanly or [onChunk] aborted it.
+     * Relies on the reader being byte-preserving (ISO-8859-1) so binary payloads survive the
+     * char round-trip intact.
+     */
+    private fun readChunkedBody(reader: BufferedReader, onChunk: (ByteArray) -> Boolean): Boolean {
+        val charBuf = CharArray(8192)
+        while (true) {
+            val sizeLine = reader.readLine() ?: return false
+            // Chunk size may carry `;extensions` which we ignore.
+            val hex = sizeLine.substringBefore(';').trim()
+            val size = hex.toIntOrNull(16) ?: return false
+            if (size == 0) break
+            val chunk = ByteArray(size)
+            var off = 0
+            while (off < size) {
+                val want = minOf(charBuf.size, size - off)
+                val n = reader.read(charBuf, 0, want)
+                if (n <= 0) return false
+                for (i in 0 until n) chunk[off + i] = charBuf[i].code.toByte()
+                off += n
+            }
+            // Consume the CRLF that terminates each chunk's data.
+            if (reader.read() < 0) return false
+            if (reader.read() < 0) return false
+            if (!onChunk(chunk)) return false
+        }
+        // Trailer section ends at the first blank line after the terminal zero chunk.
+        while (true) {
+            val line = reader.readLine() ?: break
+            if (line.isEmpty()) break
+        }
+        return true
+    }
+
+    fun handleMaxClients(socket: Socket, isAuthenticated: Boolean = false): Boolean {
+        val maxAllowed = if (isAuthenticated) maxAuthenticatedClients else maxClients
+        if (clients.size >= maxAllowed) {
+            socket.getOutputStream().writer().use { writer ->
+                writer.write("HTTP/1.1 503 Service Unavailable\r\n")
+                writer.write("Retry-After: 30\r\n") // 30 seconds
+                writer.write("Connection: close\r\n\r\n")
+                writer.flush()
+            }
+            socket.close()
+            // Add small delay to prevent rapid reconnection loops
+            Thread.sleep(100)
+            return true
+        }
+        return false
+    }
+
+    fun handleMaxH264Clients(socket: Socket, isAuthenticated: Boolean = false): Boolean {
+        val maxAllowed = if (isAuthenticated) maxAuthenticatedClients else maxClients
+        if (h264Clients.size >= maxAllowed) {
+            socket.getOutputStream().writer().use { writer ->
+                writer.write("HTTP/1.1 503 Service Unavailable\r\n")
+                writer.write("Retry-After: 30\r\n") // 30 seconds
+                writer.write("Connection: close\r\n\r\n")
+                writer.flush()
+            }
+            socket.close()
+            // Add small delay to prevent rapid reconnection loops
+            Thread.sleep(100)
+            return true
+        }
+        return false
+    }
+
+    /**
+     * Reset stored per-camera preferences for a given camera id.
+     * This will remove stored zoom/exposure/focus/rotate/scale/contrast prefs
+     * for the camera token and its physical fallback, so the server will
+     * return defaults (which now prefer the camera-reported `minZoom`).
+     */
+    fun resetCameraPreferences(cameraId: String) {
+        try {
+            val prefs = PreferenceManager.getDefaultSharedPreferences(context)
+            val editor = prefs.edit()
+            val physical = cameraId.substringAfter(':', cameraId)
+            // Known keys to remove for a camera
+            val keys = listOf(
+                "zoom_$cameraId", "zoom_$physical",
+                "exposure_$cameraId", "exposure_$physical",
+                "focus_$cameraId", "focus_$physical",
+                "camera_rotate_$cameraId", "camera_rotate_$physical",
+                "stream_scale_$cameraId", "stream_scale_$physical",
+                "camera_contrast_$cameraId", "camera_contrast_$physical",
+                "mirror_$cameraId", "mirror_$physical",
+                "snapshot_res_$cameraId", "snapshot_res_$physical"
+            )
+            keys.forEach { k -> if (prefs.contains(k)) editor.remove(k) }
+            editor.apply()
+            onLog("Reset preferences for camera $cameraId")
+
+            // Apply canonical defaults immediately so the live camera reflects the reset
+            try {
+                val info = buildDeviceInfo()
+                val cam = info.cameras.firstOrNull { it.id == cameraId }
+                    ?: info.cameras.firstOrNull { it.id.endsWith(":$cameraId") }
+                val minZoom = cam?.minZoom ?: 1.0f
+
+                val now = System.currentTimeMillis()
+                val defaults = mapOf(
+                    "resolution" to "auto",
+                    "zoom" to String.format(Locale.US, "%.1f", minZoom),
+                    "exposure" to "0",
+                    "focus_distance" to "-1",
+                    "scale" to "1.0",
+                    "contrast" to "0",
+                    "mirror" to "false",
+                    "fps" to "30",
+                    "rotate" to "0"
+                )
+
+                // Dispatch each control through the central handler so prefs are re-written
+                defaults.forEach { (k, v) ->
+                    try { onControlCommand(k, v, now) } catch (e: Exception) { onLog("Error applying default $k=$v: ${e.message}") }
+                }
+            } catch (e: Exception) {
+                onLog("Error applying defaults after reset for $cameraId: ${e.message}")
+            }
+        } catch (e: Exception) {
+            onLog("Error resetting prefs for $cameraId: ${e.message}")
+        }
+    }
+
+
+    fun setAppInForeground(foreground: Boolean) {
+        appInForeground = foreground
+    }
+
+    suspend fun stopStreamingServer() {
+        val jobToCancel: Job?
+        val socketToClose: ServerSocket?
+
+        synchronized(this) {
+            // Get references to close outside synchronized block
+            serverGeneration++
+            isStarting = false
+            jobToCancel = serverJob
+            socketToClose = serverSocket
+            serverSocket = null
+            serverJob = null
+        }
+
+        // If there's nothing to stop, return immediately
+        if (jobToCancel == null && socketToClose == null) {
+            return
+        }
+
+        // Run socket closing operations on background thread to avoid NetworkOnMainThreadException
+        withContext(Dispatchers.IO) {
+            // Close the server socket first to interrupt any blocking accept() calls
+            try {
+                socketToClose?.close()
+            } catch (e: IOException) {
+                onLog("Error closing server socket: ${e.message}")
+            }
+
+            // Cancel the server coroutine and wait for it to finish
+            jobToCancel?.cancel()
+            try {
+                // Wait for the coroutine to finish
+                jobToCancel?.join()
+            } catch (e: Exception) {
+                onLog("Error waiting for server job: ${e.message}")
+            }
+
+            // Close all client connections (this involves network operations)
+            closeClientConnection()
+
+            // Wait a bit longer to ensure port is fully released
+            try {
+                Thread.sleep(300)
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+            }
+
+        }
+    }
+
+    fun closeClientConnection() {
+        val clientsToClose = clients.toList()
+        val h264ClientsToClose = h264Clients.toList()
+        val audioClientsToClose = audioClients.toList()
+        clients.clear()
+        h264Clients.clear()
+        audioClients.clear()
+        (clientsToClose + h264ClientsToClose).forEach { client ->
+            try {
+                client.socket.close()
+            } catch (e: IOException) {
+                onLog("Error closing client connection: ${e.message}")
+            }
+        }
+        audioClientsToClose.forEach { socket ->
+            try {
+                socket.close()
+            } catch (e: IOException) {
+                onLog("Error closing audio connection: ${e.message}")
+            }
+        }
+        if (clientsToClose.isNotEmpty() || h264ClientsToClose.isNotEmpty()) onClientDisconnected()
+    }
+
+    fun removeClient(client: Client) {
+        if (!clients.remove(client)) return
+        try {
+            client.socket.close()
+        } catch (e: IOException) {
+            onLog("Error closing client socket: ${e.message}")
+        }
+        onClientDisconnected()
+    }
+
+    private data class InfoSize(val w: Int, val h: Int)
+
+    private data class InfoCamera(val id: String, val facing: String, val label: String, val sizes: List<InfoSize>, val hasFlash: Boolean, val sensorOrientation: Int, val minZoom: Float?, val maxZoom: Float?)
+
+    private data class CameraInfoSource(
+        val id: String,
+        val logicalId: String,
+        val physicalId: String?,
+        val facing: String,
+        val characteristics: CameraCharacteristics,
+        val sizesCharacteristics: CameraCharacteristics,
+        val fallbackIndex: Int,
+    )
+
+    private data class StreamSettings(
+        val cameraId: String?,
+        val resolution: String,
+        val streamRes: String,
+        val fps: String,
+        val torch: String,
+        val deviceHasFlash: Boolean,
+        val audioGain: String,
+        val snapshotRes: String,
+        val motionDetectionEnabled: Boolean,
+        val motionSensitivity: String,
+        val motionRecordStopDelay: String,
+        val onvifEnabled: Boolean,
+        val rtspEnabled: Boolean,
+        val rtspAudio: Boolean,
+        val rtspSubSize: String,
+        val rtspSubFps: String,
+        val rtspSubBitrate: String,
+    )
+
+    private data class DeviceInfo(
+        val context: Context,
+        val cameras: List<InfoCamera>,
+        val batteryPercent: Int,
+        val wifiStrength: Int,
+        val settings: StreamSettings,
+        val perCameraSettings: Map<String, Map<String, String>> = emptyMap(),
+    ) {
+        fun toJsonString(): String = JSONObject().apply {
+            put("cameras", JSONArray().apply {
+                cameras.forEach { camera ->
+                    put(JSONObject().apply {
+                        put("id", camera.id)
+                        put("facing", camera.facing)
+                        put("label", camera.label)
+                        put("hasFlash", camera.hasFlash)
+                        put("sensorOrientation", camera.sensorOrientation)
+                        try {
+                            put("zoom", JSONObject().apply {
+                                try {
+                                    if (camera.minZoom != null) put("min", String.format(Locale.US, "%.1f", camera.minZoom))
+                                    else put("min", JSONObject.NULL)
+                                } catch (_: Exception) { try { put("min", JSONObject.NULL) } catch (_: Exception) {} }
+                                try {
+                                    if (camera.maxZoom != null) put("max", String.format(Locale.US, "%.1f", camera.maxZoom))
+                                    else put("max", JSONObject.NULL)
+                                } catch (_: Exception) { try { put("max", JSONObject.NULL) } catch (_: Exception) {} }
+                            })
+                        } catch (_: Exception) {}
+                        put("sizes", JSONArray().apply {
+                            camera.sizes.forEach { size ->
+                                put(JSONObject().apply {
+                                    put("w", size.w)
+                                    put("h", size.h)
+                                })
+                            }
+                        })
+                        // Attach any stored per-camera lens/settings if available
+                        val lensMap = perCameraSettings[camera.id]
+                        if (lensMap != null && lensMap.isNotEmpty()) {
+                            put("lensSettings", JSONObject().apply {
+                                lensMap.forEach { (k, v) -> put(k, v) }
+                            })
+                        }
+                    })
+                }
+            })
+            put("batteryPercent", batteryPercent)
+            put("wifiStrength", wifiStrength)
+            put("settings", JSONObject().apply {
+                // Keep global stream-level settings here; per-camera lens settings are exposed
+                // under `cameras[].lensSettings` and should be used by the UI.
+                put("cameraId", settings.cameraId)
+                put("resolution", settings.resolution)
+                put("streamRes", settings.streamRes)
+                put("fps", settings.fps)
+                put("torch", settings.torch)
+                // Whether ANY rear lens can drive the flash — the torch is a device-level unit,
+                // so the UI may offer it even when the selected camera reports none.
+                put("deviceHasFlash", settings.deviceHasFlash)
+                put("audioGain", settings.audioGain)
+                put("snapshotRes", settings.snapshotRes)
+                put("motionDetectionEnabled", settings.motionDetectionEnabled)
+                put("motionSensitivity", settings.motionSensitivity)
+                put("motionRecordStopDelay", settings.motionRecordStopDelay)
+                // Whether RTSP/ONVIF is enabled. Motion detection is always available in the web UI.
+                put("onvifEnabled", settings.onvifEnabled)
+                put("rtspEnabled", settings.rtspEnabled)
+                put("rtspAudio", settings.rtspAudio)
+                put("rtspSubSize", settings.rtspSubSize)
+                put("rtspSubFps", settings.rtspSubFps)
+                put("rtspSubBitrate", settings.rtspSubBitrate)
+            })
+            put("appVersion", context.packageManager.getPackageInfo(context.packageName, 0).versionName.orEmpty())
+        }.toString()
+    }
+
+    private fun buildDeviceInfo(): DeviceInfo {
+        val context = context
+        val idle = clients.isEmpty() && h264Clients.isEmpty()
+        val cameraList = buildCameraInfoList(idle)
+        // Gather per-camera stored settings from SharedPreferences. Keys use suffixes like
+        // zoom_<cameraId>, exposure_<cameraId>, focus_<cameraId> which are already used
+        // by getStreamSettings()/handleRemoteControl.
+        val prefs = PreferenceManager.getDefaultSharedPreferences(context)
+        // Helper to read a string preference with fallback keys (tries keys in order)
+        fun prefStringFallback(default: String?, vararg keys: String): String? {
+            for (k in keys) {
+                if (prefs.contains(k)) return prefs.getString(k, default)
+            }
+            return default
+        }
+
+        // Helper to read an int preference with fallback keys
+        fun prefIntFallback(default: Int, vararg keys: String): Int {
+            for (k in keys) {
+                if (prefs.contains(k)) return prefs.getInt(k, default)
+            }
+            return default
+        }
+
+        val perCamera = cameraList.associate { cam ->
+            val id = cam.id
+            // Physical id may be present after ':' (e.g. "1:3")
+            val physical = id.substringAfter(':', id)
+            val map = mutableMapOf<String, String>()
+
+            // The rotate=/zoom=/scale= controls, the encoders and the GL pipes all bucket per-camera
+            // prefs by the *stored* `camera_id` (camId()). That id can be a logical id ("0") whose
+            // lenses are enumerated here as tokens ("0:2"), the physical id ("2"), the token itself,
+            // or the "back"/"front" facing fallback. `/info.json` must therefore report each entry
+            // using the stored camera's keys first (so the active camera mirrors exactly what the
+            // stream is baking in), then fall back to the entry's own token/physical keys.
+            val storedCamId = prefs.getString("camera_id", null)
+            val logicalOfStored = storedCamId?.substringBefore(':')
+            val storedPhysical = storedCamId?.substringAfter(':', storedCamId)
+            // A token stored id (e.g. "0:4") names ONE exact lens — no siblings share its keys, so
+            // only that entry (and its physical fallback) is "the stored camera". Colon-less ids are
+            // either the facing placeholder ("back"/"front") or the bare logical id used while no
+            // specific lens has been selected; those genuinely broadcast to every camera in their
+            // group/facing, because that's exactly what the stream applies when in that state.
+            val isStoredCamera = storedCamId != null && when {
+                storedCamId.contains(':') -> id == storedCamId || physical == storedPhysical
+                else -> id == storedCamId ||
+                    physical == storedCamId ||
+                    physical == storedPhysical ||
+                    id.substringBefore(':') == logicalOfStored ||
+                    (storedCamId == "back" && cam.facing == "back") ||
+                    (storedCamId == "front" && cam.facing == "front")
+            }
+            val prefBases = buildList {
+                if (isStoredCamera && storedCamId != null) {
+                    add(storedCamId)
+                    if (storedPhysical != null && storedPhysical != storedCamId) add(storedPhysical)
+                }
+                add(id)
+                if (physical != id) add(physical)
+            }
+            fun storedPrefInt(default: Int, prefix: String): Int {
+                for (base in prefBases) {
+                    val key = "$prefix$base"
+                    if (prefs.contains(key)) return prefs.getInt(key, default)
+                }
+                return default
+            }
+            fun storedPrefString(default: String?, prefix: String): String? {
+                for (base in prefBases) {
+                    val key = "$prefix$base"
+                    if (prefs.contains(key)) return prefs.getString(key, default)
+                }
+                return default
+            }
+
+            // Zoom: prefer stored-camera key, then token, then physical.
+            // Default to the camera-reported minZoom when no saved preference exists
+            val defaultMin = String.format(Locale.US, "%.1f", cam.minZoom ?: 1.0f)
+            val zoomVal = storedPrefString(defaultMin, "zoom_") ?: defaultMin
+            map["zoom"] = zoomVal
+
+            // Exposure
+            map["exposure"] = storedPrefString("0", "exposure_") ?: "0"
+
+            // Focus distance
+            map["focusDistance"] = storedPrefString("-1", "focus_") ?: "-1"
+
+            // Rotation
+            map["rotate"] = storedPrefInt(0, "camera_rotate_").toString()
+
+            // Scale
+            map["scale"] = storedPrefString("1.0", "stream_scale_") ?: "1.0"
+
+            // Contrast
+            map["contrast"] = storedPrefString("0", "camera_contrast_") ?: "0"
+
+            // Mirror
+            map["mirror"] = storedPrefString("false", "mirror_") ?: "false"
+
+            // Snapshot resolution optional (per-camera)
+            storedPrefString(null, "snapshot_res_")?.let { map["snapshotRes"] = it }
+
+            id to map
+        }
+
+        return DeviceInfo(
+            context = context,
+            cameras = cameraList,
+            batteryPercent = getBatteryPercent(),
+            wifiStrength = getWifiStrength(),
+            settings = getStreamSettings(cameraList),
+            perCameraSettings = perCamera,
+        )
+    }
+
+    private fun getStreamSettings(cameraList: List<InfoCamera> = emptyList()): StreamSettings {
+        val prefs = PreferenceManager.getDefaultSharedPreferences(context)
+        val storedCameraId = prefs.getString("camera_id", null)
+        // Prefer the stored camera id; if it's canonical (e.g. physical id) but the UI
+        // options use a logical:physical token (e.g. "1:3"), map to that token so the
+        // client can select the correct option value. Fall back to the first camera id.
+        var cameraId = storedCameraId
+        if (cameraId == null) cameraId = cameraList.firstOrNull()?.id
+        else {
+            // If the stored id isn't in cameraList but a camera has a matching physical id,
+            // prefer the cameraList id (logical:physical) so UI selection matches.
+            if (cameraList.none { it.id == cameraId }) {
+                val match = cameraList.firstOrNull { it.id.endsWith(":$cameraId") }
+                if (match != null) cameraId = match.id
+            }
+        }
+        return StreamSettings(
+            cameraId = cameraId,
+            resolution = prefs.getString("camera_resolution", "low") ?: "low",
+            streamRes = prefs.getString("stream_res", "auto") ?: "auto",
+            fps = prefs.getString("stream_fps", "30") ?: "30",
+            torch = prefs.getString("camera_torch", "off") ?: "off",
+            deviceHasFlash = anyBackCameraWithFlash(),
+            audioGain = prefs.getString("audio_gain", "1.0") ?: "1.0",
+            snapshotRes = prefs.getString("snapshot_res_$cameraId", "max") ?: "max",
+            motionDetectionEnabled = prefs.getBoolean(MotionMonitor.PREF_ENABLED, false),
+            motionSensitivity = prefs.getString(MotionMonitor.PREF_SENSITIVITY, MotionMonitor.DEFAULT_SENSITIVITY.toString())
+                ?: MotionMonitor.DEFAULT_SENSITIVITY.toString(),
+            motionRecordStopDelay = prefs.getString(MotionMonitor.PREF_STOP_DELAY, MotionMonitor.DEFAULT_STOP_DELAY.toString())
+                ?: MotionMonitor.DEFAULT_STOP_DELAY.toString(),
+            onvifEnabled = prefs.getBoolean(RtspServer.PREF_ENABLED, false),
+            rtspEnabled = prefs.getBoolean(RtspServer.PREF_ENABLED, false),
+            rtspAudio = prefs.getBoolean(RtspServer.PREF_AUDIO, true),
+            rtspSubSize = prefs.getString(RtspServer.PREF_SUB_SIZE, null)
+                ?: RtspServer.DEFAULT_SUB_SIZE.toString(),
+            rtspSubFps = prefs.getString(RtspServer.PREF_SUB_FPS, null)
+                ?: RtspServer.DEFAULT_SUB_FPS.toString(),
+            rtspSubBitrate = prefs.getString(RtspServer.PREF_SUB_BITRATE, null)
+                ?: RtspServer.DEFAULT_SUB_BITRATE_KBPS.toString(),
+        )
+    }
+
+    /** True if any rear-facing lens reports a flash unit. Auxiliary lenses (ultra-wide, depth)
+     *  often report none even though they physically share the main lens's flash — the torch is
+     *  a device-level unit, so one capable rear camera is enough to offer it everywhere. */
+    private fun anyBackCameraWithFlash(): Boolean = try {
+        val cm = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+        cm.cameraIdList.any { id ->
+            try {
+                val ch = cm.getCameraCharacteristics(id)
+                ch.get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true &&
+                    ch.get(CameraCharacteristics.LENS_FACING) != CameraCharacteristics.LENS_FACING_FRONT
+            } catch (_: Throwable) { false }
+        }
+    } catch (_: Throwable) { false }
+
+    private fun buildCameraInfoList(idle: Boolean): List<InfoCamera> {
+        val encCaps = H264HardwareEncoder.caps()
+        val cm = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+        return try {
+            val sources = cameraInfoSources(cm)
+
+            // Sensor size varies between physical lenses (e.g. ultra-wide sensors are often
+            // smaller than the main sensor), so a simple focal-length ratio (e.g. 2.22/4.38 = 0.51)
+            // understates how wide the ultra-wide lens actually is. The OEM camera HAL derives its
+            // zoom ratio from the *effective* focal length (focal length normalized by sensor
+            // width), which accounts for this. We replicate that here: effectiveFocal = focal_mm / sensorWidth_mm.
+            fun sensorWidthMm(s: CameraInfoSource): Float? = try {
+                val sz = s.sizesCharacteristics.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)
+                    ?: s.characteristics.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)
+                sz?.width?.takeIf { it > 0f }
+            } catch (_: Exception) { null }
+
+            fun focalLengthsOf(s: CameraInfoSource): FloatArray? = try {
+                s.sizesCharacteristics.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
+                    ?: s.characteristics.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
+            } catch (_: Exception) { null }
+
+            // Effective (sensor-normalized) focal length for a source; larger = narrower FOV = more "zoomed in"
+            fun effectiveFocal(s: CameraInfoSource): Float? {
+                val fl = focalLengthsOf(s)?.takeIf { it.isNotEmpty() } ?: return null
+                val sw = sensorWidthMm(s) ?: return null
+                val f = fl.maxOrNull() ?: return null
+                return f / sw
+            }
+
+            // Group by logical camera id: only lenses within the same logical multi-camera group
+            // (e.g. main + ultra-wide under logical "0") share a common zoom slider / 1.0x reference.
+            val groupMaxEffectiveFocal: Map<String, Float?> = sources.groupBy { it.logicalId }
+                .mapValues { (_, group) -> group.mapNotNull { effectiveFocal(it) }.maxOrNull() }
+
+            // Fallback: plain focal-length ratio within the same logical group (used only if
+            // sensor physical size isn't available on this device).
+            val groupMaxRawFocal: Map<String, Float?> = sources.groupBy { it.logicalId }
+                .mapValues { (_, group) ->
+                    group.mapNotNull { focalLengthsOf(it)?.maxOrNull() }.maxOrNull()
+                }
+
+            // Keep the user's saved stream size in the reported list even when the camera is busy
+            // and does not enumerate it right now (Camera1 preview sizes below are only available
+            // while idle). Without this, /info.json can omit the selected size and the web UI would
+            // treat it as unsupported and fall back to Auto.
+            val prefs = PreferenceManager.getDefaultSharedPreferences(context)
+            val storedCamId = prefs.getString("camera_id", null)
+            val savedStreamSize = Regex("^(\\d+)x(\\d+)$")
+                .find(prefs.getString("stream_res", "auto") ?: "auto")
+                ?.let { m ->
+                    val w = m.groupValues[1].toIntOrNull()
+                    val h = m.groupValues[2].toIntOrNull()
+                    if (w != null && h != null && w > 0 && h > 0) w to h else null
+                }
+
+            sources.map { source ->
+                val ch = source.sizesCharacteristics
+                val label = cameraLabel(source)
+                val set = LinkedHashSet<Pair<Int, Int>>()
+                try {
+                    val map = ch.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+                    map?.getOutputSizes(SurfaceTexture::class.java)?.forEach { set.add(it.width to it.height) }
+                    map?.getOutputSizes(android.media.MediaCodec::class.java)?.forEach { set.add(it.width to it.height) }
+                } catch (_: Exception) {}
+                if (idle) {  // Camera1 preview sizes expose 16:9 that LEGACY Camera2 omits
+                    try {
+                        @Suppress("DEPRECATION") val c1 = android.hardware.Camera.open(source.physicalId?.toIntOrNull() ?: source.logicalId.toIntOrNull() ?: source.fallbackIndex)
+                        @Suppress("DEPRECATION") c1.parameters.supportedPreviewSizes?.forEach { set.add(it.width to it.height) }
+                        @Suppress("DEPRECATION") c1.release()
+                    } catch (_: Exception) {}
+                }
+                if (savedStreamSize != null) {
+                    val savedApplies = storedCamId == null ||
+                        storedCamId == source.id ||
+                        storedCamId == source.logicalId ||
+                        storedCamId == source.physicalId ||
+                        storedCamId == source.facing
+                    if (savedApplies) set.add(savedStreamSize)
+                }
+                val sizes = set
+                    .filter { it.first <= encCaps.maxW && it.second <= encCaps.maxH }
+                    .sortedByDescending { it.first * it.second }
+                    .map { InfoSize(it.first, it.second) }
+                // Check both physical and logical characteristics for flash availability
+                // Some devices report flash on logical camera, others on physical
+                val hasFlash = ch.get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true ||
+                    source.characteristics.get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true
+                val sensorOrientation = (ch.get(CameraCharacteristics.SENSOR_ORIENTATION)
+                    ?: source.characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION)) ?: 0
+                // Gather zoom-related characteristics and compute fallbacks
+                val (minZoom, maxZoom) = try {
+                    val rangeRaw = getZoomRatioRangeSafe(ch) ?: getZoomRatioRangeSafe(source.characteristics)
+                    val focalLensRaw = focalLengthsOf(source)
+                    val scalerMaxRaw = ch.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM)
+                        ?: source.characteristics.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM)
+
+                    val thisEffectiveFocal = effectiveFocal(source)
+                    val groupMaxEff = groupMaxEffectiveFocal[source.logicalId]
+                    val thisRawFocalMax = focalLensRaw?.maxOrNull()
+                    val groupMaxRaw = groupMaxRawFocal[source.logicalId]
+
+                    // Preferred: sensor-size-normalized ratio (matches how the camera HAL derives
+                    // its multi-camera zoom ratio). Falls back to a plain focal-length ratio
+                    // (within the same logical group) if sensor physical size isn't reported.
+                    val focalDerivedMin: Float? = try {
+                        when {
+                            thisEffectiveFocal != null && groupMaxEff != null && groupMaxEff > 0f ->
+                                (thisEffectiveFocal / groupMaxEff).coerceAtLeast(0.05f)
+                            thisRawFocalMax != null && groupMaxRaw != null && groupMaxRaw > 0f ->
+                                (thisRawFocalMax / groupMaxRaw).coerceAtLeast(0.05f)
+                            else -> null
+                        }
+                    } catch (_: Exception) { null }
+
+                    val computedMin: Float? = try {
+                        when {
+                            // If the camera reports a zoom range, prefer its lower bound,
+                            // but allow a focal-derived min if it suggests a smaller (sub-1.0) min zoom.
+                            rangeRaw != null -> {
+                                val reported = rangeRaw.lower.toFloat()
+                                if (focalDerivedMin != null && focalDerivedMin < reported) focalDerivedMin else reported
+                            }
+                            // Otherwise use focal-derived min if available
+                            focalDerivedMin != null -> focalDerivedMin
+                            else -> null
+                        }
+                    } catch (_: Exception) { null }
+
+                    val computedMax: Float? = try {
+                        when {
+                            // If the scaler reports a max digital zoom, trust it directly (no artificial cap)
+                            scalerMaxRaw != null -> try { (scalerMaxRaw).toFloat() } catch (_: Exception) { null }
+                            // Otherwise derive from the same sensor-normalized ratio, inverted
+                            thisEffectiveFocal != null && groupMaxEff != null && thisEffectiveFocal > 0f ->
+                                (groupMaxEff / thisEffectiveFocal).coerceAtLeast(1.0f)
+                            thisRawFocalMax != null && groupMaxRaw != null && thisRawFocalMax > 0f ->
+                                (groupMaxRaw / thisRawFocalMax).coerceAtLeast(1.0f)
+                            else -> null
+                        }
+                    } catch (_: Exception) { null }
+
+                    // Detailed debug log to help trace why min/max were chosen
+                    // Apply rounding policy: min -> floor to 1 decimal, max -> ceil to 1 decimal
+                    fun roundDown1(v: Float) = floor(v * 10f) / 10f
+                    fun roundUp1(v: Float) = ceil(v * 10f) / 10f
+
+                    var roundedMin: Float? = null
+                    var roundedMax: Float? = null
+                    try {
+                        val focalStr = focalLensRaw?.joinToString(",") ?: "<none>"
+                        roundedMin = computedMin?.let { roundDown1(it) }
+                        roundedMax = computedMax?.let { roundUp1(it) } ?: scalerMaxRaw?.let { try { roundUp1((it).toFloat()) } catch (_: Exception) { null } }
+
+                        val minStr = roundedMin?.toString() ?: "<unknown>"
+                        val maxStr = roundedMax?.toString() ?: "<none>"
+                        val reportedLower = try { rangeRaw?.lower?.toFloat()?.toString() ?: "<none>" } catch (_: Exception) { "<err>" }
+                        val reportedUpper = try { rangeRaw?.upper?.toFloat()?.toString() ?: "<none>" } catch (_: Exception) { "<err>" }
+
+                        onLog("Camera ${source.id} zoom info: CONTROL_ZOOM_RATIO_RANGE=[$reportedLower,$reportedUpper], LENS_INFO_AVAILABLE_FOCAL_LENGTHS=$focalStr, effectiveFocal=${thisEffectiveFocal ?: "<none>"}, groupMaxEffectiveFocal=${groupMaxEff ?: "<none>"}, focalDerivedMin=${focalDerivedMin ?: "<none>"}, computedMinZoom=$minStr, computedMaxZoom=$maxStr")
+                    } catch (_: Exception) {}
+
+                    Pair(roundedMin, roundedMax)
+                } catch (_: Exception) { Pair(null, null) }
+                InfoCamera(source.id, source.facing, label, sizes, hasFlash, sensorOrientation, minZoom, maxZoom)
+            }
+        } catch (_: Throwable) {
+            emptyList()
+        }
+    }
+
+    private fun cameraInfoSources(cm: CameraManager): List<CameraInfoSource> {
+        val sources = mutableListOf<CameraInfoSource>()
+        val allPhysicalIds = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            cm.cameraIdList.flatMap { logicalId ->
+                try {
+                    cm.getCameraCharacteristics(logicalId).physicalCameraIds
+                } catch (_: Throwable) {
+                    emptySet()
+                }
+            }.toSet()
+        } else emptySet()
+        cm.cameraIdList.forEachIndexed { i, logicalId ->
+            if (logicalId in allPhysicalIds) return@forEachIndexed
+            val logical = cm.getCameraCharacteristics(logicalId)
+            val facing = when (logical.get(CameraCharacteristics.LENS_FACING)) {
+                CameraCharacteristics.LENS_FACING_FRONT -> "front"
+                CameraCharacteristics.LENS_FACING_BACK -> "back"
+                else -> "external"
+            }
+            val physicalIds = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                logical.physicalCameraIds
+                    .filter { it != logicalId }
+                    .sorted()
+            } else emptyList()
+
+            if (physicalIds.isNotEmpty()) {
+                physicalIds.forEach { physicalId ->
+                    val physical = try {
+                        cm.getCameraCharacteristics(physicalId)
+                    } catch (_: Throwable) {
+                        logical
+                    }
+                    sources.add(CameraInfoSource("$logicalId:$physicalId", logicalId, physicalId, facing, logical, physical, i))
+                }
+            } else {
+                sources.add(CameraInfoSource(logicalId, logicalId, null, facing, logical, logical, i))
+            }
+        }
+        return sources
+    }
+
+    private fun cameraLabel(source: CameraInfoSource): String {
+        val id = source.physicalId ?: source.logicalId
+        val displayId = source.physicalId ?: source.logicalId
+        val facing = source.facing
+        val ch = source.characteristics
+        val facingLabel = facing.replaceFirstChar { if (it.isLowerCase()) it.titlecase() else it.toString() }
+        val physicalLabel = "Lens $displayId"
+        val focalLengths = (source.sizesCharacteristics.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
+            ?: ch.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS))
+            ?.takeIf { it.isNotEmpty() }
+            ?.joinToString("/") { length -> "${"%.1f".format(length)}mm" }
+        return if (focalLengths == null) "$facingLabel $physicalLabel" else "$facingLabel $physicalLabel ($focalLengths)"
+    }
+
+    private fun getZoomRatioRangeSafe(ch: CameraCharacteristics?): android.util.Range<Float>? {
+        if (ch == null || android.os.Build.VERSION.SDK_INT < 29) return null
+        return try {
+            @Suppress("UNCHECKED_CAST")
+            val key = try {
+                CameraCharacteristics::class.java.getField("CONTROL_ZOOM_RATIO_RANGE").get(null) as? CameraCharacteristics.Key<android.util.Range<Float>>
+            } catch (e: NoSuchFieldException) {
+                try {
+                    @Suppress("UNCHECKED_CAST")
+                    CameraCharacteristics.Key("android.control.zoomRatioRange", android.util.Range::class.java) as? CameraCharacteristics.Key<android.util.Range<Float>>
+                } catch (_: Exception) {
+                    null
+                }
+            }
+            key?.let { ch.get(it) }
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    private fun getBatteryPercent(): Int = try {
+        val bm = context.getSystemService(Context.BATTERY_SERVICE) as? android.os.BatteryManager
+        bm?.getIntProperty(android.os.BatteryManager.BATTERY_PROPERTY_CAPACITY) ?: -1
+    } catch (_: Exception) {
+        -1
+    }
+
+    private fun getWifiStrength(): Int = try {
+        val hasWifiPermission = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
+            ContextCompat.checkSelfPermission(context, Manifest.permission.NEARBY_WIFI_DEVICES) == PackageManager.PERMISSION_GRANTED ||
+            ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+        } else {
+            ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+        }
+        if (!hasWifiPermission) {
+            -1
+        } else {
+            val wifiManager = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? android.net.wifi.WifiManager
+            val rssi = wifiManager?.connectionInfo?.rssi ?: -127
+            when {
+                rssi == -127 -> -1
+                rssi <= -100 -> 0
+                rssi >= -50 -> 100
+                else -> (rssi + 100) * 2
+            }
+        }
+    } catch (_: Exception) {
+        -1
+    }
+
+    private fun cleanupExpiredConnections() {
+        val now = System.currentTimeMillis()
+        val toRemove = clients.filter { client ->
+            val maxDuration = if (client.isAuthenticated) MAX_AUTHENTICATED_CONNECTION_DURATION_MS else MAX_CONNECTION_DURATION_MS
+            now - client.connectedAt > maxDuration
+        }
+
+        toRemove.forEach { client ->
+            val authStatus = if (client.isAuthenticated) "authenticated" else "unauthenticated"
+            onLog("Removing expired $authStatus connection from ${client.socket.inetAddress.hostAddress}")
+            removeClient(client)
+        }
+    }
+}

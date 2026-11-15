@@ -1,0 +1,42 @@
+# Ignore Gradle project-specific cache directory
+.gradle
+
+# Ignore Gradle build output directory
+build
+
+.idea
+
+local.properties
+app/debug
+app/release
+signing.properties
+app/signing-key.jks
+certificates
+.venv
+
+# Docker builder caches (see Dockerfile usage)
+.cache
+
+# local build helpers (machine-specific paths)
+_wsl_*.sh
+
+# Local APK delivery copies
+artifacts/
+
+# Private runtime and development data
+.kotlin/
+__pycache__/
+*.pyc
+.env
+.env.*
+!.env.example
+*.jks
+*.keystore
+*.p12
+*.pfx
+*.pem
+*.log
+*.apk
+captures/
+private/
+.DS_Store
