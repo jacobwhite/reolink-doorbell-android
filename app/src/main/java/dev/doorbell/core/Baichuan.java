@@ -52,8 +52,15 @@ public final class Baichuan {
     }
     public static byte[] info(MediaHub m) { ByteBuffer b=ByteBuffer.allocate(32).order(ByteOrder.LITTLE_ENDIAN);b.putInt(0x31303031).putInt(32).putInt(m.width).putInt(m.height);b.put(17,(byte)m.fps);return b.array(); }
     public static byte[] video(MediaHub.Frame f) {
-        int size=f.data().length;ByteBuffer b=ByteBuffer.allocate(24+size+((8-size%8)%8)).order(ByteOrder.LITTLE_ENDIAN);
-        b.putInt(f.key()?0x63643030:0x63643130).put(new byte[]{'H','2','6','4'}).putInt(size).putInt(0).putInt((int)f.micros()).putInt(0).put(f.data());return b.array();
+        return video(f, System.currentTimeMillis()/1000L);
+    }
+    public static byte[] video(MediaHub.Frame f, long epochSeconds) {
+        // BCMedia I-frame extension: POSIX seconds, as decoded by Neolink.
+        int extra=f.key()?4:0;
+        int size=f.data().length;ByteBuffer b=ByteBuffer.allocate(24+extra+size+((8-size%8)%8)).order(ByteOrder.LITTLE_ENDIAN);
+        b.putInt(f.key()?0x63643030:0x63643130).put(new byte[]{'H','2','6','4'}).putInt(size).putInt(extra).putInt((int)f.micros()).putInt(0);
+        if(f.key())b.putInt((int)epochSeconds);
+        b.put(f.data());return b.array();
     }
     /** AAC-LC mono 44.1kHz: add an ADTS header before BCMedia framing. */
     public static byte[] audio(MediaHub.Frame f) {

@@ -174,7 +174,7 @@ public final class NativeCameraServer extends TcpServer {
                         if(width!=hub.width || height!=hub.height || fps!=hub.fps) {
                             emit(Baichuan.info(hub));width=hub.width;height=hub.height;fps=hub.fps;
                         }
-                        byte[] data=f.audio()?Baichuan.audio(f):Baichuan.video(f);
+                        byte[] data=f.audio()?Baichuan.audio(f):Baichuan.video(f,state.clock.epochSeconds());
                         // NVR parsers need a complete BCMedia frame before another stream's
                         // frame starts, even though each fragment carries its stream message ID.
                         synchronized(mediaFrameLock) {

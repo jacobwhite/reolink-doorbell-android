@@ -132,7 +132,7 @@ public class NativeCameraServerTest {
             Baichuan.Packet info=c.receive();assertEquals(0,info.type());assertEquals("1001",text(Arrays.copyOf(info.body(),4)));assertTrue(text(Baichuan.aes(info.extension(),c.key,false)).contains("binaryData"));
             long until=System.nanoTime()+2_000_000_000L;while(d.media.clients()==0 && System.nanoTime()<until)Thread.sleep(10);assertEquals(1,d.media.clients());
             byte[] nal={0,0,0,1,0x65,1,2,3,4};d.media.publish(new MediaHub.Frame(nal,123456,true,false));
-            Baichuan.Packet video=c.receive();assertEquals("00dc",text(Arrays.copyOf(video.body(),4)));assertArrayEquals(nal,Arrays.copyOfRange(video.body(),24,33));
+            Baichuan.Packet video=c.receive();assertEquals("00dc",text(Arrays.copyOf(video.body(),4)));assertArrayEquals(nal,Arrays.copyOfRange(video.body(),28,37));
             c.command(4,"");assertEquals(200,c.receive().status());
         }}
     }
@@ -206,7 +206,7 @@ public class NativeCameraServerTest {
                     for(int part=1;part<4;part++) {
                         Baichuan.Packet fragment=c.receive();
                         assertEquals("Another stream interrupted a BCMedia frame",message,fragment.message());
-                        assertEquals(part==3?24:32000,fragment.body().length);
+                        assertEquals(part==3?28:32000,fragment.body().length);
                     }
                 }
             }

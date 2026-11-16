@@ -24,6 +24,9 @@ final class NativeClock {
         } catch(RuntimeException e) { return false; }
     }
     private int number(Document xml,String field) { return Integer.parseInt(Xml.text(xml,field)); }
+    synchronized long epochSeconds() {
+        return (epochMillis+(System.nanoTime()-anchorNanos)/1_000_000L)/1000L;
+    }
     synchronized String xml() {
         ZonedDateTime t=Instant.ofEpochMilli(epochMillis+(System.nanoTime()-anchorNanos)/1_000_000L).atZone(ZoneOffset.ofTotalSeconds(-timezone));
         return "<SystemGeneral version=\"1.1\"><timeZone>"+timezone+"</timeZone><osdFormat>"+osdFormat+"</osdFormat><timeFormat>"+timeFormat+"</timeFormat>"+
